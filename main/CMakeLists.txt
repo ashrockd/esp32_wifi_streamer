@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "tunein_control.c"
+        "radio_pipeline.c"
+        "fmp4_bridge.c"
+        "aac_dec_element.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        app_update
+        audio_pipeline
+        audio_stream
+        driver
+        esp_event
+        esp_http_client
+        esp_netif
+        esp_wifi
+        json
+        mbedtls
+        nvs_flash
+)

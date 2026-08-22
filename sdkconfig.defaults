@@ -1,0 +1,65 @@
+# ESP32-WROOM-32U: Wi-Fi/streaming half of the two-chip split. 4MB flash, no
+# PSRAM. No Bluetooth stack at all on this chip - see ../esp32_bt_speaker for
+# that half, connected over I2S (see RADIO_I2S_*_GPIO in main/app_config.h).
+
+# Real hardware: 4MB flash, no PSRAM.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Optimize for size, not speed - tight flash/IRAM budget on this board.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# WiFi's IRAM speed optimizations aren't worth the IRAM budget here (this is
+# what caused the single-chip project's earlier iram0_0_seg overflow).
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# mbedTLS per-connection RAM usage. IN_CONTENT_LEN must be >= the largest
+# single TLS record any server this chip talks to sends - not just at
+# handshake, at any point in the connection. The single-chip project's 8192
+# was sized only for opml.radiotime.com's handshake (its cert forces 8192;
+# see that project's sdkconfig.defaults for the full mbedtls_ssl_fetch_input
+# ()/-0x7100 trace history) - this chip additionally reads large (~550KB)
+# CMAF media segment bodies from itsliveradio.apple.com, a different CDN,
+# and hit the identical -0x7100 "SSL - Bad input parameters" failure on the
+# very first body read of one (confirmed via hardware log: fails right after
+# HTTP_STREAM logs total_bytes=551498, every single attempt). Raised to
+# 16384 - TLS's own hard per-record maximum - so no server's record size can
+# ever exceed this again, rather than re-guessing another host-specific
+# number. CONFIG_MBEDTLS_DYNAMIC_BUFFER means this is a ceiling the buffer
+# can grow to when actually needed, not a fixed per-session cost.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# 2026-08-20: DYNAMIC_BUFFER deliberately turned OFF on this chip.
+#
+# It was inherited from the single-chip project, where it was the right call:
+# there, classic-BT/Bluedroid churned 4112-byte allocations constantly and
+# dynamic buffers let mbedTLS avoid pinning 20KB. This chip runs no Bluetooth
+# at all, and the tradeoff inverts:
+#
+# With dynamic buffers mbedTLS FREES and RE-ALLOCATES the record buffer per
+# record. Once esp_aac_dec_open() takes its (measured) 51564-byte bite -
+# largest free block 98304 -> 49152 - those repeated ~15KB re-allocations
+# start failing partway through a segment:
+#     E Dynamic Impl: alloc(15158 bytes) failed
+#     E esp-tls-mbedtls: SSL - Memory allocation failed
+# and they failed AFTER 76478 bytes had already streamed successfully, which
+# is the signature of progressive fragmentation, not of a hard shortage.
+#
+# Static buffers allocate IN+OUT once when the connection is established and
+# hold them for the session: one up-front cost instead of a repeated demand
+# for a large contiguous block from an increasingly fragmented heap.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+
+# Logging is intentionally verbose for bring-up.
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# Required by esp_crt_bundle_attach for TuneIn/Apple HTTPS endpoints.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
+
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
