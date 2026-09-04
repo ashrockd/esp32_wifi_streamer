@@ -1,0 +1,147 @@
+# CI PATCH for the STANDALONE esp-idf tree (NOT esp-adf's bundled esp-idf
+# submodule - see ci-patches/README.md "Which ESP-IDF actually matters").
+# Base: tag v5.5.5 exactly (verified via `git describe --tags` on the real
+# dev-machine checkout at C:\esp\v5.5.5\esp-idf - zero commits past the tag,
+# these 3 files are its only local modifications). In CI this is applied to
+# the espressif/idf:v5.5.5 Docker image's own baked-in /opt/esp/idf, which is
+# the same v5.5.5 build, NOT a separately fetched checkout - see build.yml.
+#
+# Files (combined - one atomic feature, matching how ESP-ADF itself ships
+# this exact change as a single idf_patches/idf_v5.5_freertos.patch file):
+#   components/freertos/esp_additions/freertos_tasks_c_additions.h
+#   components/freertos/esp_additions/include/freertos/idf_additions.h
+#   components/freertos/linker_common.lf
+#
+# What: Adds xTaskCreateRestrictedPinnedToCore() to IDF's FreeRTOS additions
+#       layer (legacy/non-SMP kernel path only, matching this project's
+#       CONFIG_FREERTOS_SMP=n).
+#
+# Why this is here as a HAND-VERIFIED diff instead of just relying on
+# ESP-ADF's own auto-patch mechanism:
+#   esp-adf/export.ps1 and export.sh both run
+#   `python tools/adf_install_patches.py apply-patch` automatically on every
+#   activation, which is SUPPOSED to `git apply` this same change from
+#   esp-adf/idf_patches/idf_v5.5_freertos.patch onto whatever IDF tree
+#   IDF_PATH points at. On the dev machine, this failed silently: the
+#   change ended up hand-applied instead, per this project's own comment in
+#   the affected file (dated 2026-08-31) - `git apply` could not match the
+#   official patch's hunk context against this exact IDF 5.5.5 checkout
+#   (upstream apparently shifted surrounding lines, e.g. a CONFIG_FREERTOS_SMP
+#   branch added near xTaskCreateStaticPinnedToCore, between whatever exact
+#   point release idf_v5.5_freertos.patch was authored against and v5.5.5).
+#
+#   Investigating why surfaced a real bug worth flagging: adf_install_patches.py's
+#   apply_patch() runs `subprocess.run(["git","apply",...], stdout=DEVNULL,
+#   stderr=DEVNULL)` with NO check=True and NO return-code inspection at all -
+#   a failed git apply is silently swallowed, no error, no warning, the
+#   script just moves on. There is no reason to expect CI's
+#   espressif/idf:v5.5.5 image to behave differently (identical IDF version,
+#   identical patch file, identical git-apply context-matching logic), so
+#   build.yml does not trust the automatic mechanism for this file. Instead
+#   it applies THIS patch directly - diffed straight off this project's
+#   already-working v5.5.5 checkout, so it is guaranteed to match a
+#   byte-identical fresh v5.5.5 tree - and then explicitly greps the result
+#   for xTaskCreateRestrictedPinnedToCore, hard-failing the CI job
+#   immediately if it's missing rather than letting a silent no-op surface
+#   later as a confusing "undefined reference" link error.
+#
+# Confirmed load-bearing, not cosmetic: xTaskCreateRestrictedPinnedToCore is
+# called from esp-adf/components/audio_sal/audio_thread.c - ESP-ADF's own
+# task-creation abstraction, used throughout the audio pipeline. Skipping
+# this patch fails the LINK step, not the compile step.
+#
+# Apply from the esp-idf tree root (in CI: /opt/esp/idf inside the
+# espressif/idf:v5.5.5 container):
+#   git apply .github/ci-patches/esp-idf/0001-freertos-xTaskCreateRestrictedPinnedToCore.patch
+
+diff --git a/components/freertos/esp_additions/freertos_tasks_c_additions.h b/components/freertos/esp_additions/freertos_tasks_c_additions.h
+index b59262f3..22a3dd20 100644
+--- a/components/freertos/esp_additions/freertos_tasks_c_additions.h
++++ b/components/freertos/esp_additions/freertos_tasks_c_additions.h
+@@ -377,6 +377,61 @@ _Static_assert( tskNO_AFFINITY == ( BaseType_t ) CONFIG_FREERTOS_NO_AFFINITY, "C
+ #endif /* ( configSUPPORT_STATIC_ALLOCATION == 1 ) */
+ /*----------------------------------------------------------*/
+
++/* Added by esp-adf's idf_patches/idf_v5.5_freertos.patch, applied by hand on
++ * 2026-08-31 because `git apply` couldn't match the hunk context against this
++ * exact IDF 5.5.5 checkout (upstream added the CONFIG_FREERTOS_SMP branch to
++ * xTaskCreateStaticPinnedToCore above, shifting surrounding lines) - the
++ * change itself is unmodified from ESP-ADF's own patch. Only wired for the
++ * legacy (non-SMP) kernel path, matching CONFIG_FREERTOS_SMP=n in both
++ * esp32_wifi_streamer's and esp32_bt_speaker_48khz's sdkconfig - the only two
++ * projects building against this shared IDF install as of this date. */
++#if ( configSUPPORT_STATIC_ALLOCATION == 1 )
++
++    BaseType_t xTaskCreateRestrictedPinnedToCore( const TaskParameters_t * const pxTaskDefinition, TaskHandle_t *pxCreatedTask, const BaseType_t xCoreID)
++    {
++	    TCB_t *pxNewTCB;
++	    BaseType_t xReturn = errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;
++
++		configASSERT( pxTaskDefinition->puxStackBuffer );
++
++		if( pxTaskDefinition->puxStackBuffer != NULL )
++		{
++			/* Allocate space for the TCB.  Where the memory comes from depends
++			on the implementation of the port malloc function and whether or
++			not static allocation is being used. */
++			pxNewTCB = ( TCB_t * ) pvPortMalloc( sizeof( TCB_t ) );
++
++			if( pxNewTCB != NULL )
++			{
++                memset( pxNewTCB, 0, sizeof( TCB_t ) );
++				/* Store the stack location in the TCB. */
++				pxNewTCB->pxStack = pxTaskDefinition->puxStackBuffer;
++
++				/* Tasks can be created statically or dynamically, so note
++				this task had a statically allocated stack in case it is
++				later deleted.  The TCB was allocated dynamically. */
++				pxNewTCB->ucStaticallyAllocated = tskDYNAMICALLY_ALLOCATED_STACK_AND_TCB;
++
++				prvInitialiseNewTask(	pxTaskDefinition->pvTaskCode,
++										pxTaskDefinition->pcName,
++										pxTaskDefinition->usStackDepth,
++										pxTaskDefinition->pvParameters,
++										pxTaskDefinition->uxPriority,
++										pxCreatedTask, pxNewTCB,
++										pxTaskDefinition->xRegions,
++										xCoreID );
++
++				prvAddNewTaskToReadyList( pxNewTCB );
++				xReturn = pdPASS;
++			}
++		}
++
++		return xReturn;
++    }
++
++#endif /* ( configSUPPORT_STATIC_ALLOCATION == 1 ) */
++/*----------------------------------------------------------*/
++
+ #if ( configUSE_TIMERS == 1 )
+
+ /*
+diff --git a/components/freertos/esp_additions/include/freertos/idf_additions.h b/components/freertos/esp_additions/include/freertos/idf_additions.h
+index 5e50dd1b..4a4e2b12 100644
+--- a/components/freertos/esp_additions/include/freertos/idf_additions.h
++++ b/components/freertos/esp_additions/include/freertos/idf_additions.h
+@@ -107,6 +107,8 @@
+                                                 StaticTask_t * const pxTaskBuffer,
+                                                 const BaseType_t xCoreID );
+
++    BaseType_t xTaskCreateRestrictedPinnedToCore( const TaskParameters_t * const pxTaskDefinition, TaskHandle_t *pxCreatedTask, const BaseType_t xCoreID);
++
+ #endif /* configSUPPORT_STATIC_ALLOCATION */
+
+ /* ------------------------------------------------- Task Utilities ------------------------------------------------- */
+diff --git a/components/freertos/linker_common.lf b/components/freertos/linker_common.lf
+index a1fbd96b..d9231665 100644
+--- a/components/freertos/linker_common.lf
++++ b/components/freertos/linker_common.lf
+@@ -27,6 +27,7 @@ entries:
+         # Task Creation
+         tasks:xTaskCreatePinnedToCore (default)
+         tasks:xTaskCreateStaticPinnedToCore (default)
++        tasks:xTaskCreateRestrictedPinnedToCore (default)
+         # Task Utilities
+         tasks:xTaskGetCoreID (default)
+         tasks:xTaskGetIdleTaskHandleForCore (default)

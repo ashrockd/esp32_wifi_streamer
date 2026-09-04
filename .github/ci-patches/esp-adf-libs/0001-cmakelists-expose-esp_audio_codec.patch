@@ -1,0 +1,81 @@
+# CI PATCH for esp-adf's `components/esp-adf-libs` submodule
+# Base commit: 3472016 (detached HEAD - matches what esp-adf's superproject
+# index records at eac70fd2; "git submodule status" shows no +/- drift, so a
+# plain `git submodule update --init components/esp-adf-libs` from an esp-adf
+# checkout at eac70fd2 fetches exactly this commit).
+#
+# File: CMakeLists.txt
+# What: Adds esp_audio_codec's include dirs and prebuilt-library linkage
+#       (add_prebuilt_library + TARGET_LIB_NAME) alongside the existing
+#       esp_processing/esp_audio/esp_codec/esp_new_jpeg/esp_muxer entries.
+# Why:  The esp_audio_codec/ directory (headers under include/, prebuilt
+#       .a under lib/<target>/) already SHIPS inside this submodule commit -
+#       upstream esp-adf-libs just never wires it into the build. Needed for
+#       esp_aac_dec, whose esp_aac_dec_cfg_t can be told the AAC
+#       configuration explicitly (no_adts_header / sample_rate / channel)
+#       instead of sniffing it, unlike the bundled aac_decoder element,
+#       which sniffs, decides "RAW AAC", and then fails to initialize on a
+#       provably valid ADTS stream.
+# Docs: main/radio_pipeline.c ~line 349-361 - the aac_dec_element/
+#       fmp4_bridge design comment: both of ESP-ADF's stock decode paths
+#       were tried on hardware and both failed ("This audio is RAW AAC" /
+#       "Failed to initialize") on a stream proven valid offline
+#       (tools/fmp4_to_adts.py output plays fine), because CMAF/fMP4
+#       segments carry their AudioSpecificConfig once in an init segment
+#       rather than per-frame and neither stock path can be TOLD one -
+#       esp_aac_dec_cfg_t's explicit fields (exposed by this patch) are
+#       exactly what main/aac_dec_element.c uses instead.
+#       WITHOUT THIS PATCH, main/aac_dec_element.c almost certainly fails to
+#       compile/link (missing esp_audio_codec headers/symbols) - high
+#       build-necessity confidence.
+#
+# Apply from the esp-adf-libs submodule checkout root
+# (esp-adf/components/esp-adf-libs when checked out as part of esp-adf):
+#   git apply .github/ci-patches/esp-adf-libs/0001-cmakelists-expose-esp_audio_codec.patch
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b631e3b..6ee26ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,7 +15,18 @@ list(APPEND COMPONENT_ADD_INCLUDEDIRS ./esp_audio/include
+                             ./esp_new_jpeg/include
+                             ./media_lib_sal/include
+                             ./media_lib_sal/include/port
+-                            ./esp_muxer/include)
++                            ./esp_muxer/include
++                            # esp_audio_codec ships in this repo but upstream
++                            # exposes neither its headers nor its library.
++                            # Needed for esp_aac_dec, whose esp_aac_dec_cfg_t
++                            # can be told the AAC configuration explicitly
++                            # (no_adts_header / sample_rate / channel) instead
++                            # of sniffing it - the bundled aac_decoder element
++                            # sniffs, decides "RAW AAC", and then fails to
++                            # initialize on a provably valid ADTS stream.
++                            ./esp_audio_codec/include
++                            ./esp_audio_codec/include/decoder
++                            ./esp_audio_codec/include/decoder/impl)
+
+ if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
+     list(APPEND COMPONENT_ADD_INCLUDEDIRS  ./esp_media_protocols/include)
+@@ -52,6 +63,7 @@ message(STATUS "Chip is ${CONFIG_IDF_TARGET}, ${CMAKE_CURRENT_SOURCE_DIR}")
+
+ set(TARGET_LIB_PATH "-L ${CMAKE_CURRENT_SOURCE_DIR}/esp_audio/lib/${CONFIG_IDF_TARGET}"
+                     "-L ${CMAKE_CURRENT_SOURCE_DIR}/esp_codec/lib/${CONFIG_IDF_TARGET}"
++                    "-L ${CMAKE_CURRENT_SOURCE_DIR}/esp_audio_codec/lib/${CONFIG_IDF_TARGET}"
+                     "-L ${CMAKE_CURRENT_SOURCE_DIR}/esp_new_jpeg/lib/${CONFIG_IDF_TARGET}")
+
+ if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
+@@ -79,9 +91,12 @@ IF (IDF_VERSION_MAJOR GREATER 3)
+                  PRIV_REQUIRES esp-adf-libs)
+     add_prebuilt_library(esp_muxer "${CMAKE_CURRENT_SOURCE_DIR}/esp_muxer/lib/${CONFIG_IDF_TARGET}/libesp_muxer.a"
+                  PRIV_REQUIRES esp-adf-libs)
++    # See the esp_audio_codec include-path note above.
++    add_prebuilt_library(esp_audio_codec "${CMAKE_CURRENT_SOURCE_DIR}/esp_audio_codec/lib/${CONFIG_IDF_TARGET}/libesp_audio_codec.a"
++                 PRIV_REQUIRES esp-adf-libs)
+ ENDIF (IDF_VERSION_MAJOR GREATER 3)
+
+-set(TARGET_LIB_NAME esp_processing esp_audio esp_codec esp_new_jpeg esp_muxer ${esp_h264_name})
++set(TARGET_LIB_NAME esp_processing esp_audio esp_codec esp_audio_codec esp_new_jpeg esp_muxer ${esp_h264_name})
+ if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
+     list(APPEND TARGET_LIB_NAME esp_media_protocols)
+ endif()

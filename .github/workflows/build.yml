@@ -1,0 +1,176 @@
+name: Build firmware (esp32s3)
+
+# Offloads building from the dev machine (a 2013 dual-core Pentium - see
+# esp32_wifi_streamer's own project memory on why local `idf.py build` is
+# avoided there) onto GitHub's runners. This workflow reproduces what a
+# human running esp32_wifi_streamer/build.ps1 locally does - same ESP-IDF
+# version, same vendored/PATCHED ESP-ADF tree, same MINIMAL_BUILD env var,
+# same esp32s3 target - minus the interactive/flash-specific parts (build.ps1
+# only flashes when passed -Flash, and this workflow never flashes anything;
+# it just publishes a build a human can flash themselves from the artifact
+# this produces).
+#
+# READ FIRST if this is your first time looking at this workflow:
+# .github/ci-patches/README.md documents every local ESP-ADF/ESP-IDF patch
+# this workflow applies, exactly which project source comment justifies each
+# one, and (importantly) which locally-modified files in the vendored esp-adf
+# tree are deliberately NOT reproduced here because they belong to the
+# sibling esp32_bt_speaker project instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # ---------------------------------------------------------------------
+      # Layout: esp32_wifi_streamer and esp-adf must end up as TRUE SIBLING
+      # directories, because esp32_wifi_streamer/CMakeLists.txt and build.ps1
+      # both resolve ESP-ADF via a relative `..\esp-adf` reference (build.ps1:
+      # `$AdfExport = "...\esp32_bt_int_radio\esp-adf\export.ps1"`, i.e. one
+      # level up from esp32_wifi_streamer). actions/checkout's `path:` input
+      # is relative to $GITHUB_WORKSPACE, so checking both repos out with
+      # path: esp32_wifi_streamer and path: esp-adf makes them siblings
+      # directly under $GITHUB_WORKSPACE - exactly the layout the project
+      # already expects, with no path rewriting needed anywhere else in this
+      # workflow or in the project's own build files.
+      # ---------------------------------------------------------------------
+      - name: Checkout esp32_wifi_streamer
+        uses: actions/checkout@v4
+        with:
+          path: esp32_wifi_streamer
+
+      # Pinned to the EXACT commit the dev machine's vendored esp-adf checkout
+      # is sitting on (branch release/v2.x, `git describe` = v2.8-14-geac70fd2,
+      # i.e. 14 commits past tag v2.8) - see .github/ci-patches/README.md for
+      # how this was determined. Pinning a commit (not a floating branch like
+      # release/v2.x) is deliberate: this project's local patches were diffed
+      # against this exact tree, and an upstream release/v2.x commit made
+      # after this one could shift surrounding lines enough that the patches
+      # in .github/ci-patches/esp-adf/ stop applying cleanly - exactly the
+      # failure mode already independently observed with ESP-ADF's own
+      # idf_v5.5_freertos.patch (see ci-patches/esp-idf/0001-*.patch's header
+      # comment). A human deliberately bumping this pin should re-diff the
+      # patches against the new base first.
+      #
+      # submodules: false is deliberate, not an oversight - esp-adf's OWN
+      # bundled `esp-idf` submodule (pinned to v5.5.3) is never actually used
+      # by this project's real build (see ci-patches/README.md "Which
+      # ESP-IDF actually matters" for the exact evidence trail: the dev
+      # machine activates a SEPARATE, standalone v5.5.5 IDF install before
+      # esp-adf/export.ps1 ever runs, and both export.ps1/.sh AND esp-adf's
+      # own CMakeLists.txt only fall back to the bundled submodule `if
+      # IDF_PATH is not already set` - which on the real build, and in this
+      # workflow, it always is). Fetching it here would waste CI time/
+      # bandwidth on a multi-hundred-MB submodule this project never builds
+      # against, and risks someone later assuming it's the one that matters.
+      # `components/esp-sr` (speech recognition) is skipped for the same
+      # reason: nothing under main/ requires it. Only `components/esp-adf-libs`
+      # is actually needed - initialized explicitly in the next step.
+      - name: Checkout esp-adf (pinned base commit)
+        uses: actions/checkout@v4
+        with:
+          repository: espressif/esp-adf
+          ref: eac70fd266099f61211962b006f2fbc0586bc08a
+          path: esp-adf
+          submodules: false
+
+      # esp-adf-libs ships esp-adf's prebuilt codec/media libraries
+      # (esp_audio, esp_codec, esp_audio_codec, esp_muxer, ...) as binary .a
+      # files - components/audio_pipeline (a direct REQUIRES of
+      # main/CMakeLists.txt) REQUIRES it directly. `git submodule update`
+      # against the just-checked-out eac70fd2 commit naturally resolves to
+      # commit 3472016 (recorded in esp-adf's tree at that exact commit -
+      # confirmed locally via `git submodule status` showing no +/- drift),
+      # matching the base the esp-adf-libs/*.patch in ci-patches/ was diffed
+      # against. --depth 1: this submodule carries many chip targets' worth
+      # of prebuilt binaries; no need for its history.
+      - name: Init esp-adf-libs submodule only
+        working-directory: esp-adf
+        run: git submodule update --init --depth 1 -- components/esp-adf-libs
+
+      # Pulled as its own step (rather than letting `docker run` implicitly
+      # pull) purely so a slow/failed pull of this ~4.7GB image is visibly
+      # distinguishable in the Actions log from an actual build failure.
+      #
+      # Image choice (Docker vs. espressif/esp-idf-ci-action - both were
+      # investigated): this project's real build is NOT a self-contained
+      # single-repo ESP-IDF project - it activates a standalone ESP-IDF
+      # install, then a SEPARATE vendored+locally-patched ESP-ADF tree one
+      # directory up (`../esp-adf`), with a MINIMAL_BUILD env var and a
+      # forced sdkconfig regen along the way (see build.ps1). Reproducing
+      # that faithfully needs precise control over: (a) exactly when/where
+      # local patches get applied to a tree that lives OUTSIDE the checked-
+      # out project repo, (b) exactly which environment variables are set
+      # and in what order (IDF_PATH must be set before ADF_PATH's export.sh
+      # runs, or ESP-ADF's bundled-but-wrong-version esp-idf submodule would
+      # win instead - see above), and (c) a hard-fail verification step
+      # between "apply patch" and "build" (the freertos patch check). A raw
+      # `docker run` against the official espressif/idf image gives full,
+      # explicit, scriptable control over all of that (see
+      # ci-scripts/docker-build.sh) and pins the exact IDF build (compiler,
+      # python venv, component-manager version) with one image tag.
+      # espressif/esp-idf-ci-action, by contrast, is a thin wrapper around
+      # this same Docker image aimed at the common case of "one self-
+      # contained IDF project in the checked-out repo" - it does not cleanly
+      # expose a hook for "also mount and patch this second, sibling
+      # component tree before building," so using it here would mean
+      # fighting its abstraction to inject the same steps a raw `docker run`
+      # expresses directly and readably. Docker wins for this project's
+      # specific (non-standard but load-bearing) build topology.
+      - name: Pull espressif/idf:v5.5.5
+        run: docker pull espressif/idf:v5.5.5
+
+      # --entrypoint bash deliberately bypasses this image's own
+      # /opt/esp/entrypoint.sh. That script's exact behavior (whether it
+      # auto-sources export.sh before running the given command) was not
+      # confirmed, so docker-build.sh sources every export script itself,
+      # explicitly, rather than depending on unverified entrypoint behavior -
+      # sourcing export.sh twice is harmless (it's idempotent/guards against
+      # re-activation) if the entrypoint would have done it anyway.
+      #
+      # No --user override: the image's Dockerfile has no USER instruction
+      # (confirmed against the upstream Dockerfile), so it runs as root by
+      # default, which can read/write both the bind-mounted workspace
+      # (checked out as the runner's own host user) and its own baked-in
+      # /opt/esp/idf without any UID-mapping games.
+      - name: Build (apply patches, activate IDF+ADF, idf.py build)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            --entrypoint bash \
+            espressif/idf:v5.5.5 \
+            /workspace/esp32_wifi_streamer/.github/ci-scripts/docker-build.sh
+
+      # Artifact set mirrors exactly what a prior local `build.ps1` run
+      # actually produced under esp32_wifi_streamer/build/ (verified by
+      # inspecting a real build/ directory, not guessed from idf.py docs):
+      # esp32_wifi_streamer.bin/.elf, flasher_args.json, bootloader.bin,
+      # partition-table.bin. partitions.csv defines only nvs/phy_init/
+      # factory/storage (no OTA slot), so there is no ota_data_initial.bin to
+      # include. flasher_args.json + the three .bin files is everything
+      # `idf.py -p <PORT> flash` (or a raw `esptool.py write_flash
+      # @flasher_args.json`) needs to flash this build with zero local
+      # compilation - the actual point of this whole workflow. The .elf and
+      # regenerated sdkconfig are included too, for post-mortem debugging
+      # (symbolized backtraces / confirming exactly what config built) rather
+      # than flashing itself.
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32_wifi_streamer-firmware
+          path: |
+            esp32_wifi_streamer/build/esp32_wifi_streamer.bin
+            esp32_wifi_streamer/build/esp32_wifi_streamer.elf
+            esp32_wifi_streamer/build/esp32_wifi_streamer.map
+            esp32_wifi_streamer/build/flasher_args.json
+            esp32_wifi_streamer/build/bootloader/bootloader.bin
+            esp32_wifi_streamer/build/partition_table/partition-table.bin
+            esp32_wifi_streamer/sdkconfig
+          if-no-files-found: error
+          retention-days: 30

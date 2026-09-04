@@ -1,0 +1,594 @@
+# CI PATCH 5 of 5 for esp-adf (base commit eac70fd2, release/v2.x, v2.8-14-geac70fd2)
+#
+# Files (combined - one atomic feature, see ci-patches/README.md "Why some
+# patches are combined"; http_stream.c calls http_playlist_count_remaining(),
+# declared in http_playlist.h and defined in http_playlist.c, so applying a
+# subset would leave the tree non-compiling):
+#   components/audio_stream/http_stream.c
+#   components/audio_stream/include/http_stream.h
+#   components/audio_stream/http_playlist.c
+#   components/audio_stream/http_playlist.h
+#
+# What: Two additive, off-by-default features on top of stock http_stream:
+#   (a) http_stream_cfg_t.reuse_conn_same_host (bool, default false) - when
+#       enabled, skips esp_http_client_close() before a request if the new
+#       URL's host matches the currently-open connection's host AND the
+#       previous response was fully read. Every existing caller in the tree
+#       leaves this false and is byte-for-byte unaffected.
+#   (b) http_stream_get_tracks_remaining() / http_stream_playlist_insert_tracks()
+#       / http_playlist_count_remaining() - lets a caller on a SEPARATE task
+#       fetch-and-parse the next live HLS window ahead of time and hand the
+#       new segment URIs to this element's existing track queue, guarded by
+#       a new http->playlist_lock mutex (every existing single-task call site
+#       that touches the shared queue now takes the same lock too, so a
+#       concurrent prefetch insert/count can never race the element's own
+#       task - no existing call site gained a new caller or changed
+#       behavior otherwise).
+#
+# Why: Fixes an audible ~2-3s silence gap on esp32_wifi_streamer every time a
+#      live HLS window is exhausted. Stock http_stream unconditionally closes
+#      and reopens the TCP+TLS connection before every single request, even
+#      back-to-back ones to the same host (the manifest re-fetch immediately
+#      followed by fetching the segment it names) - fixed by (a). But the
+#      manifest host (itsliveradio.apple.com) differs from the media-segment
+#      host (liveradio.music.apple.com), so the manifest->first-new-segment
+#      hop is a FORCED cross-host reconnect (a) can never help with by
+#      construction - which is what (b) exists to hide instead, by already
+#      knowing the next window's segment list before the current one runs
+#      dry.
+#
+# Docs: main/radio_pipeline.c ~line 287-303 (the reuse_conn_same_host
+#         assignment and its "2-SECOND-PAUSE FIX" comment - explicitly says
+#         "LOCAL PATCH in esp-adf/components/audio_stream/http_stream.c -
+#         grep that file for 'LOCAL PATCH'")
+#       main/radio_pipeline.c ~line 563-620 (service_playlist_prefetch(),
+#         the caller of the two new http_stream_* functions)
+#       docs/tunein-hls-gapless-streaming.md sections 5c/5d (connection
+#         reuse, including why it structurally can't reach zero) and 6/6a
+#         (the prefetch mechanism, its memory cost, and two real hardware
+#         bugs found and fixed while adding it)
+#       The vendored files' own "LOCAL PATCH" comment headers - this
+#         project's established convention for marking exactly this kind
+#         of edit; grep either file for the string to find every touched
+#         spot.
+#
+# Apply from the esp-adf checkout root:
+#   git apply .github/ci-patches/esp-adf/0005-http_stream-connection-reuse-and-live-prefetch.patch
+
+diff --git a/components/audio_stream/http_stream.c b/components/audio_stream/http_stream.c
+index 65b21a71..1e41aa8c 100644
+--- a/components/audio_stream/http_stream.c
++++ b/components/audio_stream/http_stream.c
+@@ -22,6 +22,17 @@
+  *
+  */
+
++/* ================= LOCAL PATCH - esp32_bt_int_radio, 2026-08-22 =================
++ * Vendored file, modified in place (not upstream ESP-ADF) - see the matching
++ * "LOCAL PATCH" block at the top of include/http_stream.h for why. Every
++ * change below is guarded by the new, opt-in `http->reuse_conn_same_host`
++ * flag (false unless a caller explicitly sets http_stream_cfg_t's new
++ * `reuse_conn_same_host` field) - with the flag off, behavior is byte-for-
++ * byte identical to upstream for every existing http_stream user. Search
++ * this file for "LOCAL PATCH" to find every touched spot; original backed
++ * up at ../../../backups_V1.0/esp-adf/components/audio_stream/http_stream.c.V1.0
++ * before this patch. ================================================== */
++
+ #include <sys/unistd.h>
+ #include <sys/stat.h>
+ #include <string.h>
+@@ -73,6 +84,10 @@ typedef struct {
+     bool             aes_used;
+ } http_stream_hls_key_t;
+
++/* LOCAL PATCH (see top of file): max length of the "scheme://host[:port]"
++ * prefix kept in http_stream_t.reuse_conn_last_host below. */
++#define HTTP_STREAM_REUSE_HOST_MAXLEN 96
++
+ typedef struct http_stream {
+     audio_stream_type_t             type;
+     bool                            is_open;
+@@ -102,11 +117,51 @@ typedef struct http_stream {
+     int64_t                         request_range_end;
+     bool                            is_last_range;
+     const char                      *user_agent;
++    /* LOCAL PATCH (see top of file): copied from http_stream_cfg_t at init.
++     * reuse_conn_last_host holds the "scheme://host[:port]" prefix of the
++     * URL http->client is currently connected to (empty string if never
++     * connected, or right after a real _http_close() tears the client down)
++     * - compared against the NEXT request's URL in _http_load_uri() to
++     * decide whether esp_http_client_close() can be skipped. Fixed-size, not
++     * heap-allocated - this project has documented OOM history (see
++     * esp32_wifi_streamer/main/app_config.h), so no new allocation is worth
++     * introducing here for what's just a small string. */
++    bool                            reuse_conn_same_host;
++    char                            reuse_conn_last_host[HTTP_STREAM_REUSE_HOST_MAXLEN];
++    /* LOCAL PATCH (see top of file, second patch): guards every touch of
++     * playlist->tracks. NULL unless enable_playlist_parser is set - only
++     * that mode ever gets a second (prefetch) task calling in. */
++    SemaphoreHandle_t               playlist_lock;
+ } http_stream_t;
+
+ static esp_err_t http_stream_auto_connect_next_track(audio_element_handle_t el);
+ static int _update_hls_info(http_stream_t *http);
+
++/* LOCAL PATCH (see top of file): pulls just "scheme://host[:port]" out of a
++ * URL for the same-host comparison in _http_load_uri() - deliberately not a
++ * full URL parse (path/query are irrelevant to whether a connection can be
++ * reused), and deliberately no heap allocation (out/out_size is a fixed
++ * caller-owned buffer - see HTTP_STREAM_REUSE_HOST_MAXLEN). */
++static void _reuse_host_prefix(const char *url, char *out, size_t out_size)
++{
++    out[0] = '\0';
++    if (url == NULL || out_size == 0) {
++        return;
++    }
++    const char *scheme_end = strstr(url, "://");
++    if (scheme_end == NULL) {
++        return;
++    }
++    const char *host_start = scheme_end + 3;
++    const char *host_end = strchr(host_start, '/');
++    size_t len = host_end ? (size_t)(host_end - url) : strlen(url);
++    if (len >= out_size) {
++        len = out_size - 1;
++    }
++    memcpy(out, url, len);
++    out[len] = '\0';
++}
++
+ // `errno` is not thread safe in multiple HTTP-clients,
+ // so it is necessary to save the errno number of HTTP clients to avoid reading and writing exceptions of HTTP-clients caused by errno exceptions
+ int __attribute__((weak)) esp_http_client_get_errno(esp_http_client_handle_t client)
+@@ -237,7 +292,11 @@ static int _hls_uri_cb(char *uri, void *ctx)
+ {
+     http_stream_t *http = (http_stream_t *) ctx;
+     if (uri) {
++        /* LOCAL PATCH (see top of file): same lock the prefetch path takes -
++         * see playlist_lock's comment on the struct. */
++        if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+         http_playlist_insert(http->playlist, uri);
++        if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+         http->is_valid_playlist = true;
+     }
+     return 0;
+@@ -315,7 +374,10 @@ static esp_err_t _resolve_playlist(audio_element_handle_t self, const char *uri)
+         return ESP_FAIL;
+     }
+     if (http->is_main_playlist) {
++        /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb(). */
++        if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+         http_playlist_clear(http->playlist);
++        if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+     }
+     if (http->playlist->host_uri) {
+         audio_free(http->playlist->host_uri);
+@@ -342,7 +404,10 @@ static esp_err_t _resolve_playlist(audio_element_handle_t self, const char *uri)
+                 if (!strncmp(line, "File", sizeof("File") - 1)) { // This line contains url
+                     int i = 4;
+                     while (line[i++] != '='); // Skip till '='
++                    /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb(). */
++                    if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+                     http_playlist_insert(http->playlist, line + i);
++                    if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+                     http->is_valid_playlist = true;
+                 }
+             }
+@@ -374,7 +439,10 @@ static esp_err_t _resolve_playlist(audio_element_handle_t self, const char *uri)
+         if (hls_playlist_is_master(hls)) {
+             char *url = hls_playlist_get_prefer_url(hls, HLS_STREAM_TYPE_AUDIO);
+             if (url) {
++                /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb(). */
++                if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+                 http_playlist_insert(http->playlist, url);
++                if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+                 ESP_LOGI(TAG, "Add media uri %s\n", url);
+                 http->is_valid_playlist = true;
+                 http->is_main_playlist = true;
+@@ -390,7 +458,10 @@ static esp_err_t _resolve_playlist(audio_element_handle_t self, const char *uri)
+     if (hls) {
+         http->hls_sequence_no = hls_playlist_get_sequence_no(hls);
+         for (int i = 0; i < http->url_index; i++) {
++            /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb(). */
++            if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+             char *next_url = http_playlist_get_next_track(http->playlist);
++            if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+             if (next_url == NULL) {
+                 ESP_LOGE(TAG, "Url index %d over limited %d", http->url_index, i);
+                 return ESP_FAIL;
+@@ -420,7 +491,14 @@ static char *_playlist_get_next_track(audio_element_handle_t self)
+ {
+     http_stream_t *http = (http_stream_t *)audio_element_getdata(self);
+     if (http->enable_playlist_parser && http->is_playlist_resolved) {
+-        return http_playlist_get_next_track(http->playlist);
++        /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb() - this is
++         * the call site the prefetch path's inserts race against most
++         * directly (it's how the element notices the tracks prefetching just
++         * added). */
++        if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
++        char *track = http_playlist_get_next_track(http->playlist);
++        if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
++        return track;
+     }
+     return NULL;
+ }
+@@ -445,12 +523,58 @@ static void _prepare_range(http_stream_t *http, int64_t pos)
+     }
+ }
+
++/* LOCAL PATCH (see top of file): records the host http->client is connected
++ * to right now (post any redirect the caller just followed) into
++ * http->reuse_conn_last_host, so the NEXT _http_load_uri() call can tell
++ * whether it's safe to skip esp_http_client_close(). No-op unless
++ * reuse_conn_same_host is enabled - kept as one helper so both the WRITER
++ * and READER success paths below stay in sync. */
++static void _reuse_remember_current_host(http_stream_t *http)
++{
++    if (!http->reuse_conn_same_host) {
++        return;
++    }
++    char cur_url[HTTP_STREAM_REUSE_HOST_MAXLEN];
++    if (esp_http_client_get_url(http->client, cur_url, sizeof(cur_url)) == ESP_OK) {
++        _reuse_host_prefix(cur_url, http->reuse_conn_last_host, sizeof(http->reuse_conn_last_host));
++    }
++}
++
+ static esp_err_t _http_load_uri(audio_element_handle_t self, audio_element_info_t* info)
+ {
+     esp_err_t err;
+     http_stream_t *http = (http_stream_t *)audio_element_getdata(self);
+
+-    esp_http_client_close(http->client);
++    /* LOCAL PATCH (see top of file): normally this unconditionally closes
++     * the connection before every single request, forcing a fresh TCP+TLS
++     * handshake every time even when the very next request (e.g. a live HLS
++     * manifest re-fetch immediately followed by fetching the segment it
++     * names) targets the exact same host. When reuse_conn_same_host is
++     * enabled and (a) the new target's host matches the host
++     * reuse_conn_last_host recorded the connection as being on, and (b) the
++     * previous response on this connection was read to completion (so there
++     * is no leftover unread data that would desync the next response's
++     * parsing), skip the close - esp_http_client_open() below then finds
++     * client->state still >= HTTP_STATE_CONNECTED and sends the new request
++     * straight over the already-open connection instead of reconnecting. If
++     * either condition doesn't hold, this falls through to the original
++     * unconditional close, so it never risks correctness for a maybe. */
++    bool reuse_connection = false;
++    if (http->reuse_conn_same_host && http->client != NULL) {
++        char cur_url[HTTP_STREAM_REUSE_HOST_MAXLEN];
++        char new_host[HTTP_STREAM_REUSE_HOST_MAXLEN];
++        if (esp_http_client_get_url(http->client, cur_url, sizeof(cur_url)) == ESP_OK) {
++            _reuse_host_prefix(cur_url, new_host, sizeof(new_host));
++            if (new_host[0] != '\0' &&
++                strcmp(new_host, http->reuse_conn_last_host) == 0 &&
++                esp_http_client_is_complete_data_received(http->client)) {
++                reuse_connection = true;
++            }
++        }
++    }
++    if (!reuse_connection) {
++        esp_http_client_close(http->client);
++    }
+
+     if (dispatch_hook(self, HTTP_STREAM_PRE_REQUEST, NULL, 0) != ESP_OK) {
+         ESP_LOGE(TAG, "Failed to process user callback");
+@@ -463,6 +587,7 @@ static esp_err_t _http_load_uri(audio_element_handle_t self, audio_element_info_
+         err = esp_http_client_open(http->client, -1);
+         if (err == ESP_OK) {
+             http->is_open = true;
++            _reuse_remember_current_host(http); /* LOCAL PATCH */
+         }
+         return err;
+     }
+@@ -523,6 +648,7 @@ _stream_redirect:
+         }
+         return ESP_FAIL;
+     }
++    _reuse_remember_current_host(http); /* LOCAL PATCH */
+     return err;
+ }
+
+@@ -545,7 +671,10 @@ _stream_open_begin:
+     } else if (info.byte_pos == 0) {
+         uri = _playlist_get_next_track(self);
+     } else if (http->is_playlist_resolved) {
++        /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb(). */
++        if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+         uri = http_playlist_get_last_track(http->playlist);
++        if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+     }
+     if (uri == NULL) {
+         if (http->is_playlist_resolved && http->enable_playlist_parser) {
+@@ -648,7 +777,12 @@ static esp_err_t _http_close(audio_element_handle_t self)
+
+     if (AEL_STATE_PAUSED != audio_element_get_state(self)) {
+         if (http->enable_playlist_parser) {
++            /* LOCAL PATCH (see top of file): same lock as _hls_uri_cb() - a
++             * prefetch insert landing mid-clear would otherwise either be
++             * silently wiped or (worse) inserted into a half-cleared list. */
++            if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
+             http_playlist_clear(http->playlist);
++            if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
+             http->is_playlist_resolved = false;
+         }
+         audio_element_report_pos(self);
+@@ -667,6 +801,7 @@ static esp_err_t _http_close(audio_element_handle_t self)
+         esp_http_client_close(http->client);
+         esp_http_client_cleanup(http->client);
+         http->client = NULL;
++        http->reuse_conn_last_host[0] = '\0'; /* LOCAL PATCH: client is gone, nothing to reuse */
+     }
+     return ESP_OK;
+ }
+@@ -873,6 +1008,11 @@ static esp_err_t _http_destroy(audio_element_handle_t self)
+         audio_free(http->playlist->data);
+         audio_free(http->playlist);
+     }
++    /* LOCAL PATCH (see top of file): see playlist_lock's comment on the
++     * struct. */
++    if (http->playlist_lock) {
++        vSemaphoreDelete(http->playlist_lock);
++    }
+     audio_free(http);
+     return ESP_OK;
+ }
+@@ -900,6 +1040,7 @@ audio_element_handle_t http_stream_init(http_stream_cfg_t *config)
+     http->type = config->type;
+     http->enable_playlist_parser = config->enable_playlist_parser;
+     http->auto_connect_next_track = config->auto_connect_next_track;
++    http->reuse_conn_same_host = config->reuse_conn_same_host; /* LOCAL PATCH, see top of file */
+     http->hook = config->event_handle;
+     http->stream_type = config->type;
+     http->user_data = config->user_data;
+@@ -932,6 +1073,17 @@ audio_element_handle_t http_stream_init(http_stream_cfg_t *config)
+             return NULL;
+         });
+         STAILQ_INIT(&http->playlist->tracks);
++        /* LOCAL PATCH (see top of file): see playlist_lock's comment on the
++         * struct. A plain (non-recursive) mutex is enough - every call site
++         * that takes it does one http_playlist_*() call and releases, never
++         * nested. */
++        http->playlist_lock = xSemaphoreCreateMutex();
++        AUDIO_MEM_CHECK(TAG, http->playlist_lock, {
++            audio_free(http->playlist->data);
++            audio_free(http->playlist);
++            audio_free(http);
++            return NULL;
++        });
+     }
+
+     if (config->type == AUDIO_STREAM_READER) {
+@@ -999,6 +1151,14 @@ redirection:
+             esp_http_client_set_redirection(http->client);
+             goto redirection;
+         }
++        /* LOCAL PATCH (see top of file): this function is the OTHER path
++         * (besides _http_load_uri()) that can change what host http->client
++         * is connected to - without this, a track here landing on a
++         * different host than _http_load_uri() last recorded would leave
++         * reuse_conn_last_host stale, and a later _http_load_uri() call could
++         * wrongly believe it's safe to reuse a connection that has actually
++         * moved to a different host since. */
++        _reuse_remember_current_host(http);
+         return ESP_OK;
+     }
+     return ESP_FAIL;
+@@ -1017,6 +1177,39 @@ esp_err_t http_stream_get_url_index(audio_element_handle_t el, int *url_idx)
+     return ESP_OK;
+ }
+
++/* LOCAL PATCH (see top of file, second patch) - both declared in
++ * http_stream.h. */
++esp_err_t http_stream_get_tracks_remaining(audio_element_handle_t el, int *remaining)
++{
++    http_stream_t *http = (http_stream_t *)audio_element_getdata(el);
++    if (!http->enable_playlist_parser || !http->playlist || !http->is_playlist_resolved) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (!http->playlist->is_incomplete) {
++        return ESP_ERR_NOT_SUPPORTED; /* VOD - nothing live to run out of */
++    }
++    if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
++    *remaining = http_playlist_count_remaining(http->playlist);
++    if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
++    return ESP_OK;
++}
++
++esp_err_t http_stream_playlist_insert_tracks(audio_element_handle_t el, char *const *uris, int count)
++{
++    http_stream_t *http = (http_stream_t *)audio_element_getdata(el);
++    if (!http->enable_playlist_parser || !http->playlist) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (http->playlist_lock) xSemaphoreTake(http->playlist_lock, portMAX_DELAY);
++    for (int i = 0; i < count; i++) {
++        if (uris[i]) {
++            http_playlist_insert(http->playlist, uris[i]); /* dedups internally */
++        }
++    }
++    if (http->playlist_lock) xSemaphoreGive(http->playlist_lock);
++    return ESP_OK;
++}
++
+ esp_err_t http_stream_fetch_again(audio_element_handle_t el)
+ {
+     http_stream_t *http = (http_stream_t *)audio_element_getdata(el);
+diff --git a/components/audio_stream/include/http_stream.h b/components/audio_stream/include/http_stream.h
+index 7b791514..250728da 100644
+--- a/components/audio_stream/include/http_stream.h
++++ b/components/audio_stream/include/http_stream.h
+@@ -22,6 +22,59 @@
+  *
+  */
+
++/* ================= LOCAL PATCH - esp32_bt_int_radio, 2026-08-22 =================
++ * Vendored file, modified in place (not upstream ESP-ADF). Added
++ * `reuse_conn_same_host` to http_stream_cfg_t below, and the matching logic
++ * in http_stream.c's _http_load_uri()/_http_close(), to fix an audible ~2-3s
++ * silence gap on esp32_wifi_streamer every time a live HLS window is
++ * exhausted: re-fetching the manifest then the next segment forced two full
++ * back-to-back TCP+TLS handshakes to the SAME host, because _http_load_uri()
++ * unconditionally called esp_http_client_close() before every single
++ * request. See http_stream.c's matching "LOCAL PATCH" comment block for the
++ * full mechanism and why it's safe (opt-in, defaults to false/old behavior
++ * for every other caller in the esp-adf tree).
++ *
++ * If esp-adf is ever updated from upstream, this field and the matching
++ * http_stream.c changes need to be reapplied by hand - grep both files for
++ * "LOCAL PATCH" to find every touched spot. Original files backed up at
++ * ../../../backups_V1.0/esp-adf/components/audio_stream/ before this patch.
++ *
++ * 2026-08-22 (second patch, same day): reuse_conn_same_host above only
++ * shrank that gap (~1-2s measured) because it can't help at all across the
++ * one hop that matters most: the live manifest lives on a DIFFERENT host
++ * (itsliveradio.apple.com) than every media segment
++ * (liveradio.music.apple.com), so the manifest-refetch -> first-new-segment
++ * transition is a forced cross-host reconnect no same-host reuse check can
++ * skip. Fixing that for real needs the next window's track list to already
++ * be known BEFORE the current one runs out, fetched on a genuinely separate
++ * connection while http->client is still busy delivering the last known
++ * segment - not simply absorbed by a bigger ring buffer (the math: ~32KB/s
++ * stream needs ~100KB of buffer to hide a 3s stall, far past what this
++ * heap-constrained/no-PSRAM chip can spare - see esp32_wifi_streamer/main/
++ * app_config.h's RADIO_HTTP_BUFFER_BYTES history).
++ *
++ * Added below: http_stream_get_tracks_remaining() (how many tracks are left
++ * unplayed in the currently-resolved live playlist - the caller's trigger to
++ * start prefetching) and http_stream_playlist_insert_tracks() (hands a
++ * separately-fetched-and-parsed batch of new track URIs to this element,
++ * appended to the SAME queue http_playlist_auto_connect_next_track() already
++ * drains, so once they're in, the transition to them is indistinguishable
++ * from an ordinary same-window segment-to-segment hop - no FINISH_PLAYLIST
++ * event, no synchronous refetch, ever, for that boundary). Both are guarded
++ * by a new http->playlist_lock mutex (created only when
++ * enable_playlist_parser is set) because, unlike everything else in this
++ * file, these are now genuinely called from a DIFFERENT task than the
++ * http_stream element's own - see esp32_wifi_streamer/main/
++ * playlist_prefetch.c for the task that calls them and radio_pipeline.c for
++ * where it's driven from. Every existing single-task call site that touches
++ * http->playlist->tracks (_playlist_get_next_track, the http_playlist_
++ * get_last_track() call in _http_open(), _resolve_playlist()'s inserts,
++ * http_playlist_clear() in _http_close()) now takes the same lock too, only
++ * so a concurrent insert/count from the prefetch path can never race a
++ * concurrent read/mutate from the element's own task - none of those
++ * existing call sites gained a new caller or changed behavior otherwise.
++ * ================================================================= */
++
+ #ifndef _HTTP_STREAM_H_
+ #define _HTTP_STREAM_H_
+
+@@ -96,6 +149,17 @@ typedef struct {
+                                                              Range size bigger than request size is recommended */
+     const char                  *user_agent;            /*!< The User Agent string to send with HTTP requests */
+     int                         url_index;              /*!< The url index to be played in playlist */
++    /* LOCAL PATCH (see top of this file): off by default, so every existing
++     * caller/example keeps the original close-then-reopen-every-request
++     * behavior unchanged. Set true to let back-to-back requests to the SAME
++     * host (e.g. re-fetching a live HLS manifest, then the segment it names)
++     * reuse the already-open TCP+TLS connection instead of tearing it down
++     * and renegotiating from scratch each time - only takes effect when the
++     * previous response on that connection was fully read (checked via
++     * esp_http_client_is_complete_data_received() at the point of reuse), so
++     * it never risks desyncing the HTTP stream even if a response was ever
++     * left partially read for some other reason. */
++    bool                        reuse_conn_same_host;
+ } http_stream_cfg_t;
+
+ #define HTTP_STREAM_TASK_STACK          (6 * 1024)
+@@ -172,6 +236,47 @@ esp_err_t http_stream_fetch_again(audio_element_handle_t el);
+  */
+ esp_err_t http_stream_get_url_index(audio_element_handle_t el, int *url_idx);
+
++/**
++ * @brief       LOCAL PATCH (see top of this file): count not-yet-played
++ *              tracks left in the currently-resolved LIVE playlist. Meant as
++ *              a look-ahead trigger: when this drops to 0 or 1, there is
++ *              still the whole duration of the last known segment left to
++ *              play, which is plenty of lead time to fetch and parse the
++ *              next window's manifest on a separate connection before this
++ *              element would otherwise dispatch HTTP_STREAM_FINISH_PLAYLIST.
++ *
++ * @param       el         The http_stream element handle
++ * @param       remaining  Out: number of tracks not yet handed out
++ *
++ * @return
++ *     - ESP_OK on success
++ *     - ESP_ERR_INVALID_STATE if the playlist isn't resolved yet
++ *     - ESP_ERR_NOT_SUPPORTED if this isn't a live (incomplete) playlist
++ */
++esp_err_t http_stream_get_tracks_remaining(audio_element_handle_t el, int *remaining);
++
++/**
++ * @brief       LOCAL PATCH (see top of this file): append already-fetched
++ *              track URIs (e.g. from a separately parsed, newer copy of the
++ *              live manifest) to this element's live playlist queue, ahead
++ *              of it running dry. Safe to call from a different task than
++ *              the one driving this element - internally mutex-guarded
++ *              against every other call site that touches the same queue.
++ *              Duplicate URIs (segments this element already knows about)
++ *              are silently skipped, same as a normal playlist re-resolve -
++ *              see http_playlist_insert()'s existing dedup check.
++ *
++ * @param       el     The http_stream element handle
++ * @param       uris   Array of track URI strings (caller retains ownership -
++ *                     they are strdup'd internally, not taken over)
++ * @param       count  Number of entries in uris
++ *
++ * @return
++ *     - ESP_OK on success
++ *     - ESP_ERR_INVALID_STATE if playlist parsing isn't enabled on this element
++ */
++esp_err_t http_stream_playlist_insert_tracks(audio_element_handle_t el, char *const *uris, int count);
++
+ /**
+  * @brief       Set SSL server certification
+  * @note        EM format as string, if the client requires to verify server
+diff --git a/components/audio_stream/http_playlist.c b/components/audio_stream/http_playlist.c
+index 70d3c2e8..c0b618b3 100644
+--- a/components/audio_stream/http_playlist.c
++++ b/components/audio_stream/http_playlist.c
+@@ -133,6 +133,19 @@ char* http_playlist_get_last_track(http_playlist_t *playlist)
+     return uri;
+ }
+
++/* LOCAL PATCH - esp32_bt_int_radio, 2026-08-22: see http_playlist.h. */
++int http_playlist_count_remaining(http_playlist_t *playlist)
++{
++    int n = 0;
++    track_t *track;
++    STAILQ_FOREACH(track, &playlist->tracks, next) {
++        if (!track->is_played) {
++            n++;
++        }
++    }
++    return n;
++}
++
+ void http_playlist_clear(http_playlist_t *playlist)
+ {
+     track_t *track, *tmp;
+diff --git a/components/audio_stream/http_playlist.h b/components/audio_stream/http_playlist.h
+index 5313110e..97f39cce 100644
+--- a/components/audio_stream/http_playlist.h
++++ b/components/audio_stream/http_playlist.h
+@@ -88,6 +88,20 @@ char *http_playlist_get_last_track(http_playlist_t *playlist);
+  */
+ void http_playlist_clear(http_playlist_t *playlist);
+
++/* LOCAL PATCH - esp32_bt_int_radio, 2026-08-22: count not-yet-played tracks,
++ * for a caller deciding whether it's time to prefetch the next live window
++ * ahead of running out. See the matching LOCAL PATCH block at the top of
++ * http_stream.c/.h; original backed up at
++ * ../../../backups_V1.0.1/esp-adf/components/audio_stream/http_playlist.h.V1.0.1 */
++/**
++ * @brief       Count not-yet-played tracks remaining in the playlist
++ *
++ * @param       playlist: Playlist handle
++ *
++ * @return      Number of tracks not yet handed out by http_playlist_get_next_track()
++ */
++int http_playlist_count_remaining(http_playlist_t *playlist);
++
+ #ifdef __cplusplus
+ }
+ #endif

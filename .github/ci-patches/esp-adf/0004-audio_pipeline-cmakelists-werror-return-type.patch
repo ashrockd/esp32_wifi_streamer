@@ -1,0 +1,28 @@
+# CI PATCH 4 of 5 for esp-adf (base commit eac70fd2, release/v2.x, v2.8-14-geac70fd2)
+#
+# File:   components/audio_pipeline/CMakeLists.txt
+# What:   Adds target_compile_options(${COMPONENT_LIB} PRIVATE
+#         -Wno-error=return-type).
+# Why:    audio_pipeline is a direct REQUIRES of main/CMakeLists.txt, so this
+#         component always builds. Presumably added because this ESP-IDF
+#         version's default warning flags promote a missing-return warning
+#         somewhere in audio_pipeline's sources to a hard error.
+# Docs:   NOT referenced anywhere under main/ - discovered purely via
+#         `git -C esp-adf diff`. WITHOUT THIS PATCH THE BUILD FAILS TO
+#         COMPILE (not just "builds wrong") - high build-necessity
+#         confidence despite not being doc-linked, from what REQUIRES and
+#         the flag name imply.
+#
+# Apply from the esp-adf checkout root:
+#   git apply .github/ci-patches/esp-adf/0004-audio_pipeline-cmakelists-werror-return-type.patch
+
+diff --git a/components/audio_pipeline/CMakeLists.txt b/components/audio_pipeline/CMakeLists.txt
+index da246fe5..78a93614 100644
+--- a/components/audio_pipeline/CMakeLists.txt
++++ b/components/audio_pipeline/CMakeLists.txt
+@@ -9,3 +9,5 @@ set(COMPONENT_SRCS "audio_element.c"
+ set(COMPONENT_REQUIRES audio_sal esp-adf-libs)
+
+ register_component()
++
++target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=return-type)

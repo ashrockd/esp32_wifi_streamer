@@ -1,0 +1,75 @@
+# CI PATCH 1 of 5 for esp-adf (base commit eac70fd2, release/v2.x, v2.8-14-geac70fd2)
+#
+# File:   components/audio_board/m5stack_atoms3r/board_pins_config.c
+# What:   Repoints get_i2s_pins() from stock M5Stack AtomS3R pins
+#         (bck=8 ws=6 dout=5 din=7 mck=-1) to esp32_wifi_streamer's actual
+#         wiring (bck=4 ws=5 dout=6, no din/mclk - TX-only I2S master).
+# Why:    i2s_stream_idf5.c's i2s_driver_startup() calls the SELECTED BOARD's
+#         get_i2s_pins() and memcpy()s the result straight over
+#         tx_std_cfg.gpio_cfg, unconditionally, immediately before
+#         i2s_channel_init_std_mode() - there is no public ESP-ADF API to
+#         override this or to reach the i2s_chan_handle_t afterwards. So the
+#         app-level pin #defines in main/app_config.h do NOT reach the
+#         hardware on their own; THIS function is what actually wins.
+#         Building against an unpatched/fresh esp-adf checkout compiles fine
+#         and boots fine - it just silently drives the wrong GPIOs. No
+#         compile error, no runtime error, just a dead/wrong I2S bus.
+# Docs:   main/app_config.h, RADIO_I2S_BCLK_GPIO comment block (~line 270-296)
+#         main/radio_pipeline.c, check_i2s_pins() and its header comment
+#         (~line 96-153) - this project's own runtime guard against exactly
+#         this class of drift (reads pins back via this same function and
+#         refuses to start the pipeline on a mismatch). That guard only helps
+#         once firmware is running on real hardware; it cannot catch the same
+#         drift in a CI build, which is why build.yml greps this file's
+#         applied result as its CI-side equivalent check.
+#
+# Apply from the esp-adf checkout root:
+#   git apply .github/ci-patches/esp-adf/0001-i2s-pin-override-m5stack_atoms3r.patch
+
+diff --git a/components/audio_board/m5stack_atoms3r/board_pins_config.c b/components/audio_board/m5stack_atoms3r/board_pins_config.c
+index 23c655d7..1510e402 100644
+--- a/components/audio_board/m5stack_atoms3r/board_pins_config.c
++++ b/components/audio_board/m5stack_atoms3r/board_pins_config.c
+@@ -47,15 +47,37 @@ esp_err_t get_i2c_pins(i2c_port_t port, i2c_config_t *i2c_config)
+     return ESP_OK;
+ }
+
++/* 2026-08-31, LOCAL EDIT - NOT upstream ESP-ADF, and NOT real M5Stack
++ * AtomS3R hardware pins any more (those were 8/6/5/7, kept below in the
++ * comment). Repointed at esp32_wifi_streamer's actual I2S wiring.
++ *
++ * Why here and not in the app: i2s_stream_idf5.c's i2s_driver_startup()
++ * calls get_i2s_pins() and then memcpy()s the result straight over
++ * tx_std_cfg.gpio_cfg - UNCONDITIONALLY, immediately before
++ * i2s_channel_init_std_mode() - so whatever radio_pipeline.c puts in
++ * i2s_cfg.std_cfg.gpio_cfg is overwritten and discarded. ESP-ADF exposes no
++ * public API to set the pins or reach the i2s_chan_handle_t afterwards, so
++ * this function IS the only place the pins are actually decided.
++ *
++ * Safe to repoint because esp32_wifi_streamer is the only project selecting
++ * this board (CONFIG_M5STACK_ATOMS3R_BOARD in its sdkconfig.defaults);
++ * ../../esp32_bt_speaker_48khz selects CONFIG_ESP_LYRAT_V4_3_BOARD and is
++ * unaffected by this file. Keep these three in sync with
++ * esp32_wifi_streamer/main/app_config.h's RADIO_I2S_*_GPIO - they are
++ * deliberately duplicated, and app_config.h is the one humans read.
++ *
++ * Upstream values, for anyone restoring this to stock M5Stack AtomS3R:
++ *   bck 8, ws 6, data_out 5, data_in 7, mck -1
++ */
+ esp_err_t get_i2s_pins(int port, board_i2s_pin_t *i2s_config)
+ {
+     AUDIO_NULL_CHECK(TAG, i2s_config, return ESP_FAIL);
+     if (port == 0) {
+-        i2s_config->bck_io_num = GPIO_NUM_8;
+-        i2s_config->ws_io_num = GPIO_NUM_6;
+-        i2s_config->data_out_num = GPIO_NUM_5;
+-        i2s_config->data_in_num = GPIO_NUM_7;
+-        i2s_config->mck_io_num = -1;
++        i2s_config->bck_io_num = GPIO_NUM_4;      /* RADIO_I2S_BCLK_GPIO */
++        i2s_config->ws_io_num = GPIO_NUM_5;       /* RADIO_I2S_WS_GPIO   */
++        i2s_config->data_out_num = GPIO_NUM_6;    /* RADIO_I2S_DATA_GPIO */
++        i2s_config->data_in_num = -1;             /* TX-only master link */
++        i2s_config->mck_io_num = -1;              /* no MCLK wire        */
+     } else if (port == 1) {
+         i2s_config->bck_io_num = -1;
+         i2s_config->ws_io_num = -1;

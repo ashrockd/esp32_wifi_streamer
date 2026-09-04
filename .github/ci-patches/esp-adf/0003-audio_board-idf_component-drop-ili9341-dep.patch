@@ -1,0 +1,31 @@
+# CI PATCH 3 of 5 for esp-adf (base commit eac70fd2, release/v2.x, v2.8-14-geac70fd2)
+#
+# File:   components/audio_board/idf_component.yml
+# What:   Removes the component-manager dependency on esp_lcd_ili9341 ("^1"),
+#         replacing it with an empty dependencies map.
+# Why:    Not documented anywhere under main/ - this is a lower-confidence
+#         patch, included because it is a real, verified local edit (see
+#         `git -C esp-adf diff -- components/audio_board/idf_component.yml`)
+#         and reproducing it is safe (it only removes a dependency this
+#         project's board never uses; m5stack_atoms3r has no LCD). This
+#         manifest is shared by the WHOLE audio_board component, not
+#         per-board, so it is resolved by the IDF component manager
+#         regardless of which board is selected via Kconfig.
+#         FLAG FOR HUMAN REVIEW: root cause not confirmed (possibly a
+#         registry-resolution issue specific to the dev machine, which CI's
+#         network access might not reproduce either way) - safe to keep
+#         either way, but worth a second look if CI ever needs this
+#         dependency back for an unrelated reason.
+#
+# Apply from the esp-adf checkout root:
+#   git apply .github/ci-patches/esp-adf/0003-audio_board-idf_component-drop-ili9341-dep.patch
+
+diff --git a/components/audio_board/idf_component.yml b/components/audio_board/idf_component.yml
+index 2814fd69..c093387c 100644
+--- a/components/audio_board/idf_component.yml
++++ b/components/audio_board/idf_component.yml
+@@ -1,2 +1 @@
+-dependencies:
+-  esp_lcd_ili9341: "^1"
+\ No newline at end of file
++dependencies: {}
