@@ -272,6 +272,33 @@
  * not eat into the very headroom it exists to measure. */
 #define RADIO_RESOURCE_LOG_INTERVAL_MS (30 * 1000)
 
+/* Self-healing safety net, added 2026-09-04 after a hardware log showed
+ * mbedtls_ssl_setup failing ("SSL - Memory allocation failed") with
+ * DMA-capable free down to ~16.5KB - against a healthy baseline of
+ * ~150KB seen in every other session - and staying that low for at
+ * least 18 seconds across a successful playback boundary in between,
+ * not just a brief spike. DMA-capable/internal RAM (MALLOC_CAP_DMA) is
+ * the ~300KB-total pool TLS and Wi-Fi both need slices of to function at
+ * all; unlike this board's 8MB of PSRAM (leak-tolerant for a long time -
+ * see [[esp32-wifi-streamer-aac-heap-crash]]'s deliberate PSRAM leak on
+ * decoder teardown), there is no slack here at all. Whatever the exact
+ * source (suspected but NOT confirmed: some of that same deliberately-
+ * abandoned decoder memory may not be purely PSRAM - PVMP4AudioDecoder's
+ * own allocator is closed-source, so this cannot be verified from
+ * project code), a leak in this specific pool has no other recovery path
+ * short of a reboot, which reclaims everything unconditionally. This is
+ * a mitigation for the SYMPTOM (silent TLS/Wi-Fi failures that never
+ * crash outright, so nothing else here would ever notice or recover),
+ * not a fix for whatever the underlying source turns out to be. */
+#define RADIO_DMA_FREE_CRITICAL_BYTES   (24 * 1024)
+/* Consecutive RADIO_RESOURCE_LOG_INTERVAL_MS ticks (so ~90s at the default
+ * 30s interval) DMA-capable free must stay under the threshold above
+ * before rebooting - gives a genuine brief peak (e.g. two overlapping TLS
+ * connections at once: the main stream plus an opportunistic playlist
+ * prefetch, both real and expected) a chance to clear on its own first,
+ * rather than rebooting on a single momentary dip. */
+#define RADIO_DMA_FREE_CRITICAL_STREAK  3
+
 /* I2S output to the Bluetooth chip - this chip is the I2S MASTER (drives
  * BCLK+WS, sends data on DOUT). Must match ../../esp32_bt_speaker's
  * app_config.h pin numbers exactly - not by GPIO NUMBER (the two boards are

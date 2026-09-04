@@ -44,7 +44,7 @@ static const int WIFI_CONNECTED_BIT = BIT0;
  * `context` is just a free-text tag (e.g. "boot", "periodic") so the log can
  * be grepped/compared across a run without needing timestamps lined up by
  * hand. */
-static void log_ram_usage(const char *context)
+static size_t log_ram_usage(const char *context)
 {
     multi_heap_info_t info8 = {0};
     heap_caps_get_info(&info8, MALLOC_CAP_8BIT);
@@ -73,6 +73,7 @@ static void log_ram_usage(const char *context)
     ESP_LOGI(TAG, "RAM [%s]: DMA-capable free=%u, 32-bit-aligned free=%u, PSRAM free=%u%s",
              context, (unsigned)dma_free, (unsigned)exec32_free, (unsigned)spiram_free,
              spiram_free == 0 ? " (no PSRAM fitted/enabled)" : "");
+    return dma_free;
 }
 
 static void log_flash_usage(void)
@@ -124,7 +125,32 @@ static void log_flash_usage(void)
 static void resource_log_timer_cb(void *arg)
 {
     (void)arg;
-    log_ram_usage("periodic");
+    size_t dma_free = log_ram_usage("periodic");
+
+    /* Self-healing reboot on sustained critical DMA-capable/internal RAM
+     * pressure - see RADIO_DMA_FREE_CRITICAL_BYTES's comment in
+     * app_config.h for the hardware evidence and full reasoning. Streak-
+     * based (not a reboot on the first low reading) so a real, brief,
+     * expected dip - e.g. the main stream and an opportunistic playlist
+     * prefetch both holding a TLS connection open at once - gets a chance
+     * to clear on its own first. */
+    static int s_dma_low_streak;
+    if (dma_free < RADIO_DMA_FREE_CRITICAL_BYTES) {
+        s_dma_low_streak++;
+        ESP_LOGW(TAG, "DMA-capable free=%u bytes is critically low (< %d) - streak %d/%d "
+                 "before a self-healing reboot",
+                 (unsigned)dma_free, RADIO_DMA_FREE_CRITICAL_BYTES,
+                 s_dma_low_streak, RADIO_DMA_FREE_CRITICAL_STREAK);
+        if (s_dma_low_streak >= RADIO_DMA_FREE_CRITICAL_STREAK) {
+            ESP_LOGE(TAG, "DMA-capable RAM critically low for %d consecutive checks (~%" PRIu32
+                     "s) with no recovery - rebooting to reclaim it before TLS/Wi-Fi fail outright",
+                     s_dma_low_streak,
+                     (uint32_t)(s_dma_low_streak * (RADIO_RESOURCE_LOG_INTERVAL_MS / 1000)));
+            esp_restart();
+        }
+    } else {
+        s_dma_low_streak = 0;
+    }
 
     /* 2026-09-04, TEMPORARY DIAGNOSTIC (see sdkconfig.defaults' matching
      * comment on CONFIG_HEAP_POISONING_LIGHT) - two real hardware crashes
