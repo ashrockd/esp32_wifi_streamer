@@ -87,7 +87,24 @@ static const char *TAG = "LED_VIZ";
 
 /* NVS-persisted brightness threshold - see led_viz_set_threshold_db(). */
 #define LED_NVS_NAMESPACE "led_viz"
-#define LED_NVS_KEY       "thr_db_c100" /* dBFS * 100, stored as an int32 (0.01dB resolution) */
+#define LED_NVS_KEY       "thr_db_c100"  /* dBFS * 100, stored as an int32 (0.01dB resolution) */
+#define LED_LATENCY_NVS_KEY "latency_ms" /* int32 milliseconds - see led_viz_set_latency_ms() */
+
+/* --- LED/audio latency compensation ------------------------------------
+ * See led_viz.h's doc comment on led_viz_set_latency_ms() for the "why":
+ * what the LED renders and what a human hears are separated by a real,
+ * measurable delay dominated by the downstream Bluetooth hop, not by
+ * anything on this chip.
+ *
+ * 8s is a deliberately generous cap, not a guess at how large a real
+ * measurement will be (real A2DP/SBC latency is realistically 100s of ms,
+ * not seconds) - the whole history buffer this supports is a few KB (see
+ * the per-entry size below), trivial even without touching PSRAM, so there
+ * is no real cost to supporting a much larger delay than anyone should ever
+ * actually need. It just means a wildly-mistaken manual `latency` entry
+ * clamps to something still usable instead of needing a second correction. */
+#define LED_LATENCY_MAX_MS      8000
+#define LED_LATENCY_HISTORY_LEN (LED_LATENCY_MAX_MS / LED_FRAME_MS)  /* 400 entries at 20ms/frame */
 
 static rmt_channel_handle_t s_chan;
 static rmt_encoder_handle_t s_encoder;
@@ -107,6 +124,40 @@ static volatile int64_t s_last_pcm_us;
  * written from whatever task calls led_viz_set_threshold_db() (the console
  * command handler) and read every frame by the render task - no lock. */
 static volatile float s_thresh_dbfs = LED_DEFAULT_THRESHOLD_DBFS;
+
+/* Runtime-adjustable render delay, in milliseconds - see
+ * led_viz_set_latency_ms()'s doc comment in led_viz.h. Same atomicity
+ * argument as s_thresh_dbfs. 0 = no delay (default; identical to this
+ * file's pre-2026-09-04 behaviour). */
+static volatile int32_t s_latency_ms;
+
+/*
+ * Rolling history of this render task's OWN post-envelope brightness level,
+ * one entry per LED_FRAME_MS tick - the delay line led_viz_set_latency_ms()
+ * reads from. Only ever written/read by led_viz_task() itself (the render
+ * loop), so no locking despite living at file scope - it is not shared with
+ * led_viz_feed_pcm()'s decoder-task caller the way s_peak is.
+ *
+ * Why delay this (the ALREADY-COMPUTED level) rather than the raw peak/
+ * have_audio pair feeding into it: the attack/decay envelope in led_viz_task
+ * is a simple recurrence (this frame's level depends only on last frame's
+ * level and this frame's target), so running it in real time against the
+ * TRUE, undelayed audio timeline and then delaying its OUTPUT for display
+ * produces the identical result as delaying the input and replaying the
+ * envelope later - but only the former keeps the envelope's own attack/decay
+ * shape faithful to how the audio actually evolved, which is the whole
+ * point of an envelope follower. Delay is applied purely at the READ (render)
+ * step below, never at the WRITE step, which is also what keeps this a
+ * simple flat array indexed by frame count rather than a real circular
+ * buffer needing per-entry timestamps: the render loop's own fixed
+ * LED_FRAME_MS cadence already IS the time axis.
+ */
+typedef struct {
+    float level;
+    bool  have_audio;
+} led_history_entry_t;
+static led_history_entry_t s_history[LED_LATENCY_HISTORY_LEN];
+static uint32_t s_history_write_idx;
 
 /* Sends one pixel. WS2812 wants GRB order, not RGB - the single most common
  * way a driver like this comes out looking "wrong colour" rather than
@@ -261,19 +312,55 @@ static void led_viz_task(void *arg)
             target = dbfs_to_level(dbfs);
         }
 
-        /* Fast attack, slow decay. */
+        /* Fast attack, slow decay - computed in REAL TIME against the true,
+         * undelayed audio timeline. See s_history's comment above for why:
+         * the delay is applied only when READING this history back for
+         * display, a few lines down, never here. */
         float coeff = (target > level) ? LED_ATTACK : LED_DECAY;
         level += (target - level) * coeff;
         if (level < 0.0005f) {
             level = 0.0f;
         }
 
+        /* Record this frame, then read back whatever frame is
+         * led_viz_get_latency_ms() worth of frames in the past - clamped to
+         * both the buffer's own capacity and to how much history actually
+         * exists yet (right after boot there may not be LED_LATENCY_MAX_MS
+         * of it) so this never wraps into a not-yet-written slot. At the
+         * default 0ms latency, delay_frames is 0 and this reads back the
+         * exact entry just written - i.e. identical to rendering `level`
+         * directly, the pre-2026-09-04 behaviour, bit for bit. */
+        uint32_t write_slot = s_history_write_idx % LED_LATENCY_HISTORY_LEN;
+        s_history[write_slot].level = level;
+        s_history[write_slot].have_audio = have_audio;
+
+        uint32_t delay_frames = (uint32_t)(s_latency_ms / LED_FRAME_MS);
+        if (delay_frames > LED_LATENCY_HISTORY_LEN - 1) {
+            delay_frames = LED_LATENCY_HISTORY_LEN - 1;
+        }
+        if (delay_frames > s_history_write_idx) {
+            delay_frames = s_history_write_idx; /* startup ramp-up: can't look back further than we've run */
+        }
+        uint32_t read_slot = (s_history_write_idx - delay_frames) % LED_LATENCY_HISTORY_LEN;
+        float display_level = s_history[read_slot].level;
+        bool display_have_audio = s_history[read_slot].have_audio;
+
+        s_history_write_idx++;
+
         uint8_t r, g, b;
-        if (!have_audio) {
-            /* Fully idle - black, not a dim colour. See LED_SILENCE_TIMEOUT_US. */
+        if (!display_have_audio) {
+            /* Fully idle - black, not a dim colour. See LED_SILENCE_TIMEOUT_US.
+             * Gated on the DELAYED audio-presence flag, not `have_audio`
+             * directly - otherwise the LED would cut to black the instant
+             * this chip's source feed stops, even while several hundred ms
+             * to a few seconds of already-fed audio is still queued up
+             * behind it, on its way to actually being heard. */
             r = g = b = 0;
         } else {
-            hsv_to_rgb(current_hue(), 1.0f, level_to_brightness(level), &r, &g, &b);
+            /* Hue is deliberately NOT delayed - it is a pure function of
+             * wall-clock time (current_hue()), entirely audio-independent,
+             * so there is no audio-timeline value for it to lag behind. */
+            hsv_to_rgb(current_hue(), 1.0f, level_to_brightness(display_level), &r, &g, &b);
         }
         led_write_rgb(r, g, b);
 
@@ -380,9 +467,89 @@ float led_viz_get_threshold_db(void)
     return s_thresh_dbfs;
 }
 
+static int32_t clamp_latency_ms(int32_t ms)
+{
+    if (ms < 0) ms = 0;
+    if (ms > LED_LATENCY_MAX_MS) ms = LED_LATENCY_MAX_MS;
+    return ms;
+}
+
+/* Mirrors load_threshold() exactly - see its comment. */
+static void load_latency(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved LED latency yet (%s); using default 0ms (uncalibrated)",
+                 esp_err_to_name(err));
+        s_latency_ms = 0;
+        return;
+    }
+
+    int32_t ms = 0;
+    err = nvs_get_i32(handle, LED_LATENCY_NVS_KEY, &ms);
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved LED latency yet (%s); using default 0ms (uncalibrated)",
+                 esp_err_to_name(err));
+        s_latency_ms = 0;
+        return;
+    }
+
+    ms = clamp_latency_ms(ms);
+    ESP_LOGI(TAG, "Resuming saved LED/audio latency compensation: %" PRId32 "ms", ms);
+    s_latency_ms = ms;
+}
+
+esp_err_t led_viz_set_latency_ms(int32_t latency_ms)
+{
+    int32_t clamped = clamp_latency_ms(latency_ms);
+    s_latency_ms = clamped; /* applied immediately regardless of whether the NVS write below succeeds */
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not open NVS to persist LED latency: %s (applied now, "
+                 "will NOT survive a restart)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_i32(handle, LED_LATENCY_NVS_KEY, clamped);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not persist LED latency %" PRId32 "ms: %s (applied now, "
+                 "will NOT survive a restart)", clamped, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "LED/audio latency compensation set to %" PRId32 "ms (saved)", clamped);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+int32_t led_viz_get_latency_ms(void)
+{
+    return s_latency_ms;
+}
+
+void led_viz_reset_history(void)
+{
+    /* Not touched by the render task concurrently in any way that matters:
+     * worst case it overwrites a slot the render loop is about to overwrite
+     * anyway on its very next tick. memset is not atomic against that, but
+     * the failure mode is at most one stale/mixed frame during a mode
+     * transition that is already expected to show a brief blackout - see
+     * led_viz.h's doc comment on when this is called. */
+    memset(s_history, 0, sizeof(s_history));
+    s_history_write_idx = 0;
+}
+
 esp_err_t led_viz_start(void)
 {
     load_threshold();
+    load_latency();
 
     rmt_tx_channel_config_t chan_cfg = {
         .gpio_num = RADIO_LED_GPIO,

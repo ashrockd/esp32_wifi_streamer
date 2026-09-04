@@ -86,3 +86,43 @@ void led_viz_feed_pcm(const void *pcm, size_t bytes);
  */
 esp_err_t led_viz_set_threshold_db(float threshold_dbfs);
 float led_viz_get_threshold_db(void);
+
+/*
+ * 2026-09-04: LED/audio latency compensation.
+ *
+ * Physically, what the LED renders and what a human actually HEARS are two
+ * different things separated by real time: this chip taps PCM right as it
+ * enters the I2S ring buffer, but the sound that reaches a human ear has
+ * since crossed the I2S wire to the companion esp32_bt_speaker chip, been
+ * resampled, SBC-encoded, sent over Bluetooth A2DP, and decoded/amplified by
+ * the BT speaker itself - a chain very likely dominated by the Bluetooth hop
+ * (commonly 100s of ms for A2DP/SBC), not by anything on this chip. The LED
+ * was reacting to audio the instant it was DECODED, not the (materially
+ * later) instant it was actually HEARD.
+ *
+ * led_viz_set_latency_ms() compensates by delaying which point in the
+ * level's own recent history gets RENDERED, without delaying the actual
+ * audio going out over I2S at all - see led_viz.c's render loop. The value
+ * is intended to be measured empirically (console_cli.h's `cal` command
+ * drives an interactive human-in-the-loop measurement: play a tone, note
+ * when it's actually heard) rather than guessed, since the true end-to-end
+ * figure depends on hardware this chip cannot see or query.
+ *
+ * Persists to NVS (namespace "led_viz", same as the threshold above) and
+ * survives a restart. Clamped to [0, LED_LATENCY_MAX_MS] (led_viz.c) - 0
+ * (the default before anything has ever been calibrated) reproduces the
+ * original zero-delay behaviour exactly.
+ */
+esp_err_t led_viz_set_latency_ms(int32_t latency_ms);
+int32_t led_viz_get_latency_ms(void);
+
+/*
+ * Clears the level-history buffer the latency delay line reads from,
+ * without touching the calibrated latency value itself. Call this around a
+ * context switch that makes recent history meaningless for what's about to
+ * be shown - console_cli.h's `cal` command calls this both entering AND
+ * leaving calibration mode, so neither real playback's tail nor the test
+ * tone's own history bleeds across that boundary. Safe to call at any time;
+ * harmless (a few frames of black/silence) even outside that use case.
+ */
+void led_viz_reset_history(void);

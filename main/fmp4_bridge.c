@@ -12,11 +12,21 @@
 
 static const char *TAG = "FMP4_BRIDGE";
 
-/* Generous but bounded: the real Apple/TuneIn stream's moof boxes run ~9KB
- * (751 samples/fragment); this caps runaway allocation from a corrupt or
- * unexpected stream without needing PSRAM. */
-#define FMP4_MAX_MOOF_BYTES     (16 * 1024)
-#define FMP4_MAX_SAMPLES        2048
+/* Caps runaway allocation from a corrupt or unexpected stream - the real
+ * Apple/TuneIn stream's moof boxes run ~9KB (751 samples/fragment), so even
+ * the ORIGINAL 16KB/2048 here already had ~1.7x headroom.
+ *
+ * 2026-09-04: widened further (16KB->64KB, 2048->4096 samples) as a general
+ * fail-safe margin pass. The original sizing was deliberately chosen "without
+ * needing PSRAM" (see the history below) - this project has since migrated
+ * to an ESP32-S3 with 8MB of PSRAM, so that constraint no longer applies, and
+ * there is no reason to run this cap close to observed reality when 8MB is
+ * available. Still a hard cap, not unbounded - a station with a genuinely
+ * pathological moof (corrupt stream, or a fragmentation scheme wildly
+ * different from this project's one confirmed working stream) fails cleanly
+ * (ESP_FAIL, logged) rather than accepting an arbitrarily large allocation. */
+#define FMP4_MAX_MOOF_BYTES     (64 * 1024)
+#define FMP4_MAX_SAMPLES        4096
 #define FMP4_IN_CHUNK_BYTES     1536
 
 /* Claimed up front in fmp4_bridge_init(), NOT lazily on the first fragment.
@@ -28,9 +38,13 @@ static const char *TAG = "FMP4_BRIDGE";
  *     E FMP4_BRIDGE: OOM allocating 9096 bytes for moof (have 0)
  * Both buffers still grow on demand if a stream ever needs more; these are
  * just the sizes actually observed on this stream (moof 9092-9104 bytes,
- * 750-751 samples) plus headroom. */
-#define FMP4_PREALLOC_MOOF_BYTES  (12 * 1024)
-#define FMP4_PREALLOC_SAMPLES     1024
+ * 750-751 samples) plus headroom - widened 2026-09-04 (12KB->16KB samples
+ * 1024->2048) alongside the MAX_* caps above, same PSRAM-headroom reasoning;
+ * this only affects heap layout at element-init time (see the OOM history
+ * just above), not the FMP4_MAX_* caps' role of rejecting a pathological
+ * stream outright. */
+#define FMP4_PREALLOC_MOOF_BYTES  (16 * 1024)
+#define FMP4_PREALLOC_SAMPLES     2048
 
 /* moov parsing (one-shot, on the small init segment) is capped separately -
  * real init segments are a few hundred bytes. */

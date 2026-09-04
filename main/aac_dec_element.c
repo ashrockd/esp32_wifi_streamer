@@ -54,9 +54,19 @@ static const char *TAG = "AAC_DEC";
 #define AAC_DEC_PCM_BYTES        8192
 
 /* Compressed input held per process() call. Real frames on this stream run
- * ~470-1060 bytes (measured from a captured segment), so this holds at least
- * one whole frame plus a partial - which is all the refill logic needs. */
-#define AAC_DEC_IN_BYTES         2048
+ * ~470-1060 bytes (measured from a captured segment), so this held at least
+ * one whole frame plus a partial - which is all the refill logic needs -
+ * even at the old 2048.
+ *
+ * 2026-09-04: widened 2048 -> 4096 (still ~4x the largest observed frame, up
+ * from ~2x) as a general fail-safe margin pass across this file's buffers -
+ * this board has 8MB of PSRAM, so a few extra KB here buys real robustness
+ * against a bitrate spike or a station with larger frames for effectively
+ * free. This buffer was not implicated in the AAC_DEC_PCM_BYTES crash above
+ * (it is filled by audio_element_input(), a well-behaved, explicitly
+ * length-capped read - not written by the decoder library the way pcm_buf
+ * is), so this is precautionary, not a fix for a known issue. */
+#define AAC_DEC_IN_BYTES         4096
 
 typedef struct {
     void    *dec;               /* esp_aac_dec handle */
@@ -102,6 +112,25 @@ static esp_err_t aac_dec_open(audio_element_handle_t self)
              heap_before, esp_get_free_heap_size(),
              (int32_t)heap_before - (int32_t)esp_get_free_heap_size(),
              block_before, heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+    /* 2026-09-04, TEMPORARY DIAGNOSTIC - narrows down WHEN a confirmed heap
+     * corruption (see main.c's periodic heap_caps_check_integrity_all() and
+     * its own matching comment) actually happens, relative to this element's
+     * lifecycle. Three real hardware crashes so far have all traced to
+     * PVMP4AudioDecoderDeInit() - esp_aac_dec_open()'s own internal cleanup,
+     * called from THIS element's close() - freeing a buffer whose heap
+     * header had been overwritten with zeros. Checking right here, the
+     * instant esp_aac_dec_open() returns success, answers the single most
+     * useful open question: did esp_aac_dec_open() ITSELF already leave the
+     * heap corrupted (this check fails), or does the damage happen later,
+     * during decode (see the periodic check in aac_dec_process() below) -
+     * ruling one of those two out entirely is worth more than another blind
+     * backtrace. Remove alongside every other TEMPORARY DIAGNOSTIC in this
+     * project once a fix is confirmed stable. */
+    if (!heap_caps_check_integrity_all(true)) {
+        ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED immediately after esp_aac_dec_open() returned "
+                 "success - the damage happened DURING open(), not later during decode");
+    }
     return ESP_OK;
 }
 
@@ -345,6 +374,26 @@ static audio_element_err_t aac_dec_process(audio_element_handle_t self,
         ESP_LOGW(TAG, "no frame found in a full %d-byte buffer; resyncing",
                  AAC_DEC_IN_BYTES);
         d->in_fill = 0;
+    }
+
+    /* 2026-09-04, TEMPORARY DIAGNOSTIC - see aac_dec_open()'s matching
+     * comment for the full context. Complements the open()-time check: if
+     * THAT one comes back clean but the heap is later found corrupt at
+     * close(), the damage happened somewhere in between - i.e. during
+     * decode. Every ~50 calls (~1/second at this stream's ~21ms/frame rate,
+     * not every single call - a full heap walk here is cheap next to a
+     * decode, but not free, and this runs on the decode path itself) rather
+     * than gating on `produced > 0`, so a corruption caused by a call that
+     * DIDN'T produce output (an error/skip path) is not systematically
+     * missed. Static counter is safe unguarded: this element has exactly one
+     * task, so aac_dec_process() is never called concurrently with itself. */
+    static uint32_t s_integrity_check_counter;
+    if ((++s_integrity_check_counter % 50) == 0) {
+        if (!heap_caps_check_integrity_all(true)) {
+            ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED during ordinary decode (call #%" PRIu32
+                     ") - the damage happens WHILE DECODING, not at open() or close()",
+                     s_integrity_check_counter);
+        }
     }
 
     return produced > 0 ? produced : AEL_IO_OK;
