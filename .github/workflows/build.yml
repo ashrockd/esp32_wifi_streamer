@@ -69,9 +69,30 @@ jobs:
       # workflow, it always is). Fetching it here would waste CI time/
       # bandwidth on a multi-hundred-MB submodule this project never builds
       # against, and risks someone later assuming it's the one that matters.
-      # `components/esp-sr` (speech recognition) is skipped for the same
-      # reason: nothing under main/ requires it. Only `components/esp-adf-libs`
-      # is actually needed - initialized explicitly in the next step.
+      # Only `components/esp-adf-libs` and `components/esp-sr` are actually
+      # needed - both initialized explicitly in the next step (NOT the
+      # `esp-idf` submodule, per the "Which ESP-IDF actually matters"
+      # reasoning above).
+      #
+      # 2026-09-04 CORRECTION: an earlier version of this comment claimed
+      # esp-sr could be skipped because "nothing under main/ requires it".
+      # That was wrong, and the first real CI run proved it wrong -
+      # `components/audio_stream/CMakeLists.txt` (a DIRECT REQUIRES of
+      # main/CMakeLists.txt) has `list(APPEND COMPONENT_REQUIRES esp-sr)`
+      # UNCONDITIONALLY, regardless of MINIMAL_BUILD (MINIMAL_BUILD limits
+      # which components CMake's configure step even LOOKS at, to the
+      # REQUIRES closure starting from main - it does not, and cannot,
+      # shrink what a component already in that closure itself requires).
+      # Skipping the submodule left `components/esp-sr` present as an empty
+      # directory (checked out from the esp-adf superproject, just with no
+      # submodule content), which fails CMake's component resolution outright:
+      # "Failed to resolve component 'esp-sr' required by component
+      # 'audio_recorder': unknown name." Confirmed locally afterward: this
+      # dev machine's own working ../esp-adf checkout has this exact
+      # submodule populated (pinned at 8ecc462b, `git submodule status`
+      # shows zero drift against the eac70fd2 base) - it was never actually
+      # optional, the local build has just always had it present without
+      # anyone having to think about it.
       - name: Checkout esp-adf (pinned base commit)
         uses: actions/checkout@v4
         with:
@@ -83,16 +104,21 @@ jobs:
       # esp-adf-libs ships esp-adf's prebuilt codec/media libraries
       # (esp_audio, esp_codec, esp_audio_codec, esp_muxer, ...) as binary .a
       # files - components/audio_pipeline (a direct REQUIRES of
-      # main/CMakeLists.txt) REQUIRES it directly. `git submodule update`
-      # against the just-checked-out eac70fd2 commit naturally resolves to
-      # commit 3472016 (recorded in esp-adf's tree at that exact commit -
-      # confirmed locally via `git submodule status` showing no +/- drift),
-      # matching the base the esp-adf-libs/*.patch in ci-patches/ was diffed
-      # against. --depth 1: this submodule carries many chip targets' worth
-      # of prebuilt binaries; no need for its history.
-      - name: Init esp-adf-libs submodule only
+      # main/CMakeLists.txt) REQUIRES it directly. esp-sr (speech
+      # recognition) is required unconditionally by components/audio_stream's
+      # own CMakeLists.txt (also a direct REQUIRES of main/CMakeLists.txt) -
+      # see the correction above; main/ never calls into esp-sr itself, but
+      # CMake still needs the component to RESOLVE, not just link. `git
+      # submodule update` against the just-checked-out eac70fd2 commit
+      # naturally resolves each to the exact commit recorded in esp-adf's
+      # tree at that commit (confirmed locally via `git submodule status`
+      # showing no +/- drift for either), matching the base
+      # esp-adf-libs/*.patch in ci-patches/ was diffed against. --depth 1:
+      # both submodules carry many chip targets'/models' worth of prebuilt
+      # binaries; no need for their history.
+      - name: Init esp-adf-libs and esp-sr submodules
         working-directory: esp-adf
-        run: git submodule update --init --depth 1 -- components/esp-adf-libs
+        run: git submodule update --init --depth 1 -- components/esp-adf-libs components/esp-sr
 
       # Pulled as its own step (rather than letting `docker run` implicitly
       # pull) purely so a slow/failed pull of this ~4.7GB image is visibly

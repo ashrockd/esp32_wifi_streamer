@@ -123,12 +123,14 @@ echo "::endgroup::"
 # project.cmake is included, before project() triggers component resolution -
 # see that file's own comment, and the project memory on MINIMAL_BUILD
 # previously being dead code before that wiring was fixed). Restricts CMake's
-# component discovery to main's actual REQUIRES closure instead of scanning
-# esp-adf's entire components/ tree (esp-sr, dueros_service, clouds, esp_coze,
-# every OTHER board's driver, ...) - main/CMakeLists.txt already lists a
-# complete explicit REQUIRES, so this does not change what gets built, only
-# how much irrelevant tree CMake's configure step has to look at first. Purely
-# a speed optimization in principle, but skipping it here would still be a
+# component discovery to main's actual REQUIRES closure (which DOES include
+# esp-sr - transitively, via audio_stream, not directly - see build.yml's
+# submodule-checkout step for the full story) instead of scanning esp-adf's
+# entire components/ tree (dueros_service, clouds, esp_coze, every OTHER
+# board's driver, ...) - main/CMakeLists.txt already lists a complete
+# explicit REQUIRES, so this does not change what gets built, only how much
+# irrelevant tree CMake's configure step has to look at first. Purely a
+# speed optimization in principle, but skipping it here would still be a
 # real, unnecessary deviation from what build.ps1 actually does - and a slower
 # configure step is a real CI-minutes cost against a ~4.7GB image pull already
 # eating into the job.
