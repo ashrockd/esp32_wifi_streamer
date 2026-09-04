@@ -9,6 +9,7 @@
 #include "esp_system.h"
 #include "audio_element.h"
 #include "audio_mem.h"
+#include "nowplaying.h"
 
 static const char *TAG = "FMP4_BRIDGE";
 
@@ -28,6 +29,26 @@ static const char *TAG = "FMP4_BRIDGE";
 #define FMP4_MAX_MOOF_BYTES     (64 * 1024)
 #define FMP4_MAX_SAMPLES        4096
 #define FMP4_IN_CHUNK_BYTES     1536
+
+/* 2026-09-05: 'emsg' (DASH/CMAF "event message") boxes share this SAME
+ * moof-sized buffer (see box_buf/box_cap below) rather than getting a
+ * second allocation of their own - one is never mid-buffer while the other
+ * is (a stream has one box open at a time), so reusing it costs nothing and
+ * avoids a second ~9-16KB heap block on a project that has OOM'd from
+ * exactly this kind of duplicate allocation before (see FMP4_PREALLOC_MOOF_
+ * BYTES's comment). This is where TuneIn/Apple's per-track now-playing
+ * metadata actually lives on the wire: Apple wraps a plain ID3v2 tag
+ * (TIT2/TPE1/TALB/WXXX) as this box's message_data, re-embedded fresh every
+ * few KB throughout a segment (confirmed against a real captured segment,
+ * tools/tunin test/seg.mp4). Rather than parsing emsg's own header fields
+ * (scheme_id_uri/value/timescale/...) to find where message_data starts,
+ * the whole buffered box body is just handed to nowplaying_ingest_id3_tag()
+ * (nowplaying.h), which byte-scans for a valid ID3v2 header wherever it
+ * actually is - the exact same technique that already has to tolerate a
+ * stray "ID3" substring inside emsg's own scheme_id_uri text (see that
+ * function's own comment), so no separate emsg field parser is needed here
+ * at all. */
+#define FMP4_MAX_EMSG_BYTES     FMP4_MAX_MOOF_BYTES
 
 /* Claimed up front in fmp4_bridge_init(), NOT lazily on the first fragment.
  *
@@ -83,13 +104,18 @@ typedef struct {
     uint8_t hdr_buf[8];
     int     hdr_have;
 
-    /* generic box buffering (moof). Grow-only and REUSED across fragments -
-     * see the note on sample_cap below; a moof is ~9KB and arrives every
-     * ~16s, so malloc/free-ing it per fragment is pure heap churn. */
+    /* generic box buffering (moof, and now emsg - see FMP4_MAX_EMSG_BYTES's
+     * comment). Grow-only and REUSED across fragments - see the note on
+     * sample_cap below; a moof is ~9KB and arrives every ~16s, so malloc/
+     * free-ing it per fragment is pure heap churn. */
     uint8_t *box_buf;
     uint32_t box_cap;
     uint32_t box_want;
     uint32_t box_have;
+    /* Which of the two box types currently being buffered into box_buf -
+     * decides what runs when it's complete (parse_moof() vs
+     * nowplaying_ingest_id3_tag()). Meaningless outside FMP4_ST_BOX_BUFFER. */
+    bool     box_buf_is_emsg;
 
     /* generic box skipping (styp/sidx/emsg/free/ftyp-repeat/...) */
     uint32_t skip_remaining;
@@ -598,7 +624,45 @@ static esp_err_t fmp4_bridge_feed(audio_element_handle_t self, fmp4_bridge_t *b,
                 }
                 b->box_want = body_len;
                 b->box_have = 0;
+                b->box_buf_is_emsg = false;
                 b->state = FMP4_ST_BOX_BUFFER;
+            } else if (strcmp(type, "emsg") == 0) {
+                /* now-playing metadata - see FMP4_MAX_EMSG_BYTES's comment.
+                 * Unlike moof, an oversized/malformed emsg is NOT fatal to
+                 * playback (it carries no audio) - skip it and keep going,
+                 * same as any other box type this element doesn't care
+                 * about, rather than failing the whole pipeline over a
+                 * metadata box. */
+                if (body_len > FMP4_MAX_EMSG_BYTES) {
+                    ESP_LOGW(TAG, "emsg box too large (%u bytes, max %d); skipping - now-playing metadata "
+                             "will just be missing until the next one", (unsigned)body_len, FMP4_MAX_EMSG_BYTES);
+                    b->skip_remaining = body_len;
+                    b->state = body_len ? FMP4_ST_BOX_SKIP : FMP4_ST_BOX_HEADER;
+                } else {
+                    if (body_len > b->box_cap) {
+                        uint8_t *grown = audio_malloc(body_len);
+                        if (!grown) {
+                            /* Same "not fatal" stance as oversize above - just
+                             * skip this one rather than failing the pipeline
+                             * over a transient allocation failure for
+                             * metadata that isn't needed for audio at all. */
+                            ESP_LOGW(TAG, "OOM allocating %u bytes for emsg (have %u); skipping",
+                                     (unsigned)body_len, (unsigned)b->box_cap);
+                            b->skip_remaining = body_len;
+                            b->state = body_len ? FMP4_ST_BOX_SKIP : FMP4_ST_BOX_HEADER;
+                            break;
+                        }
+                        if (b->box_buf) {
+                            audio_free(b->box_buf);
+                        }
+                        b->box_buf = grown;
+                        b->box_cap = body_len;
+                    }
+                    b->box_want = body_len;
+                    b->box_have = 0;
+                    b->box_buf_is_emsg = true;
+                    b->state = FMP4_ST_BOX_BUFFER;
+                }
             } else if (strcmp(type, "mdat") == 0) {
                 if (b->sample_count == 0 || b->sample_sizes == NULL) {
                     ESP_LOGW(TAG, "mdat with no preceding usable moof/trun; skipping %u bytes", (unsigned)body_len);
@@ -626,7 +690,11 @@ static esp_err_t fmp4_bridge_feed(audio_element_handle_t self, fmp4_bridge_t *b,
             len -= (int)take;
             if (b->box_have >= b->box_want) {
                 if (b->box_buf) {
-                    parse_moof(b, b->box_buf, b->box_want);
+                    if (b->box_buf_is_emsg) {
+                        nowplaying_ingest_id3_tag(b->box_buf, b->box_want);
+                    } else {
+                        parse_moof(b, b->box_buf, b->box_want);
+                    }
                     /* Retained for the next fragment - see box_cap. */
                 }
                 b->state = FMP4_ST_BOX_HEADER;

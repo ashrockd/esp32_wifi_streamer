@@ -134,8 +134,9 @@ static void log_flash_usage(void)
  * radio_pipeline_get_stream_stats() comment) - it's computed from the delta
  * in http_reader's own byte counter across two ticks of this exact timer.
  * Track title/artist/album/artwork (nowplaying.h) is likewise a cheap,
- * non-blocking read of whatever radio_pipeline.c's own background poller
- * last found - see its own file comment for the whole mechanism. */
+ * non-blocking read - of whatever fmp4_bridge.c last sniffed straight out
+ * of the CMAF stream it already parses for playback, no separate fetch of
+ * its own - see nowplaying.h's own file comment for the whole mechanism. */
 static void log_playback_status(void)
 {
     uint8_t idx = station_list_get_now_playing();
@@ -358,25 +359,13 @@ static void radio_task(void *pvParameters)
                  esp_err_to_name(prefetch_err));
     }
 
-    /* Same one-time setup pattern as playlist_prefetch_init() just above -
-     * see nowplaying.h. Not fatal on failure: the periodic status log just
-     * keeps reporting no track data (nowplaying_get_current() degrades to
-     * out->valid == false when nowplaying_init() was never called), audio
-     * playback itself is completely unaffected either way. */
-    esp_err_t nowplaying_err = nowplaying_init(esp_crt_bundle_attach);
-    if (nowplaying_err != ESP_OK) {
-        ESP_LOGW(TAG, "nowplaying_init failed: %s; the status log will not show track info",
-                 esp_err_to_name(nowplaying_err));
-    }
-
     /* Tracks whether the loop below is about to (re)start THE SAME station
-     * or a genuinely different one, so nowplaying_reset() (main.c-line
-     * usage below) only fires on a real switch - see nowplaying.h's own
-     * comment on why a routine same-station session refresh must NOT clear
-     * the currently-displayed track. Deliberately not RADIO_STATION_COUNT
-     * (an impossible value - every real index is < that), so the very
-     * first iteration always counts as "changed" and polls promptly rather
-     * than waiting to be sure. */
+     * or a genuinely different one, so nowplaying_reset() below only fires
+     * on a real switch - see nowplaying.h's own comment on why a routine
+     * same-station session refresh must NOT clear the currently-displayed
+     * track. Seeded to RADIO_STATION_COUNT - an impossible real index
+     * (every real one is < that) - so the very first loop iteration always
+     * counts as "changed" too, which is harmless (nothing to reset yet). */
     uint8_t previous_station_idx = (uint8_t)RADIO_STATION_COUNT;
 
     while (true) {
@@ -398,9 +387,10 @@ static void radio_task(void *pvParameters)
         if (current_station_idx != previous_station_idx) {
             /* A GENUINE station change (or the very first loop pass) - see
              * nowplaying.h's own comment for why this must not fire on a
-             * routine same-station session refresh (radio_pipeline.c's own
-             * next_nowplaying_poll_tick reset already handles polling
-             * promptly for those without touching what is displayed). */
+             * routine same-station session refresh: fmp4_bridge.c keeps
+             * sniffing the SAME station's tags across one either way, so
+             * the last known track is still correct and clearing it would
+             * just flicker the status log for no reason. */
             nowplaying_reset();
             previous_station_idx = current_station_idx;
         }
@@ -565,6 +555,7 @@ void app_main(void)
     esp_log_level_set("LED_VIZ", ESP_LOG_DEBUG);
     esp_log_level_set("CONSOLE", ESP_LOG_DEBUG);
     esp_log_level_set("LATENCY_CAL", ESP_LOG_DEBUG);
+    esp_log_level_set("NOWPLAYING", ESP_LOG_DEBUG);
 
     ESP_LOGI(TAG, "ESP32 Wi-Fi/streamer chip booting (I2S -> esp32_bt_speaker)");
     ESP_LOGI(TAG, "Compiled-in default station=%s (%u stations available; the one actually started is "
@@ -588,6 +579,22 @@ void app_main(void)
     err = led_viz_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "LED visualiser unavailable: %s (audio is unaffected)", esp_err_to_name(err));
+    }
+
+    /* Now-playing (title/artist/album/artwork) result cache (nowplaying.h) -
+     * started here for the same "independent of Wi-Fi, ready before it's
+     * needed" reason as led_viz_start() above. Just creates a mutex - no
+     * network I/O of its own any more (see nowplaying.h's header comment):
+     * fmp4_bridge.c feeds it directly from the CMAF stream it already
+     * parses for playback, once radio_task/the pipeline are up. Not fatal
+     * on failure: the periodic status log just keeps reporting no track
+     * data (nowplaying_get_current() degrades to out->valid == false when
+     * nowplaying_init() was never called), audio playback itself is
+     * completely unaffected either way. */
+    err = nowplaying_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nowplaying_init failed: %s; the status log will not show track info",
+                 esp_err_to_name(err));
     }
 
     /* AVRCP next/previous-station receiver (avrcp_uart.h) - started here,

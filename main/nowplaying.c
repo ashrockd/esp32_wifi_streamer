@@ -1,51 +1,78 @@
 #include "nowplaying.h"
 
-#include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "NOWPLAYING";
 
-/* One buffer, reused sequentially for both fetches this task makes (the
- * playlist body, then the segment's ID3 prefix) - same "allocate fresh per
- * attempt, free before the task exits" reasoning as playlist_prefetch.c's
- * PREFETCH_BODY_BUF_BYTES (see its own comment for the OOM-at-pipeline-
- * startup history that motivated NOT preallocating this permanently).
- *
- * Sizing: real playlist bodies observed on this stream run ~5.7KB (tools/
- * tunin test/variant.m3u8) - comfortably under this. For the segment prefix,
- * a real captured segment (tools/tunin test/seg.mp4) showed the full ID3v2
- * tag (header + PRIV + 2x WXXX + TALB/TPE1/TIT2) runs ~4.1KB and repeats
- * roughly every 4.2KB throughout the segment - 16KB comfortably contains
- * the first repeat in full even if the segment's leading boxes (styp/emsg
- * framing before the first tag) push its start back a bit, and gives 2-3x
- * redundancy against a truncated first copy. */
-#define NOWPLAYING_FETCH_BUF_BYTES  (16 * 1024)
-#define NOWPLAYING_TASK_STACK_BYTES 4096
-#define NOWPLAYING_TASK_PRIORITY    3
-#define NOWPLAYING_HTTP_TIMEOUT_MS  8000
-
-static esp_err_t (*s_crt_bundle_attach)(void *conf) = NULL;
 static SemaphoreHandle_t s_mutex = NULL;
-static volatile bool s_in_flight = false;
 
-/* Shared result state, protected by s_mutex - written only by the poll
- * task's very last step before it deletes itself, read only by
- * nowplaying_get_current(). age_ms in nowplaying_info_t is NOT stored here;
- * it is derived from s_updated_tick at read time. */
-static nowplaying_info_t s_current;
+/* Published result + all parsing scratch below are PSRAM-backed pointers,
+ * not plain static arrays - this board has 8MB of PSRAM (ESP32-S3 N16R8),
+ * so several KB of text scratch has no business sitting in the same tight
+ * internal/DMA-capable RAM pool this project has crashed over before (see
+ * RADIO_DMA_FREE_CRITICAL_BYTES in app_config.h). Allocated ONCE, up front,
+ * in nowplaying_init() - same "claim it while the heap is clean" convention
+ * fmp4_bridge_init()/playlist_prefetch.c already use for their own buffers
+ * - and never freed (this module lives for the process's whole lifetime,
+ * same as those). Every function below checks for NULL before touching any
+ * of these (allocation failure should never happen on this board with 8MB
+ * free at boot, but degrades to a safe no-op rather than crashing if it
+ * somehow ever did).
+ *
+ * s_current/s_updated_tick: the PUBLISHED result, protected by s_mutex -
+ * written only by nowplaying_ingest_id3_tag() (fmp4_bridge.c's element
+ * task), read only by nowplaying_get_current() (main.c's periodic status
+ * log, a different task). age_ms in nowplaying_info_t is NOT stored here;
+ * it is derived from s_updated_tick at read time.
+ *
+ * Everything else (s_scratch*, s_ingest_result): parsing scratch, touched
+ * ONLY from nowplaying_ingest_id3_tag()'s own call chain - see this file's
+ * header comment on the threading model for why plain (non-mutex'd) shared
+ * state is safe here: a ~700-byte nowplaying_info_t plus a ~350-byte WXXX
+ * decode scratch would eat a large fraction of fmp4_bridge's own small
+ * element task stack as ordinary locals, so this state has to live
+ * somewhere other than that call chain's stack regardless of which RAM
+ * pool it's in - PSRAM is simply the strictly better choice of the two
+ * once it's being pulled off the stack anyway. s_ingest_result is the
+ * final per-tag result find_latest_track()/track_from_id3_tag() build up
+ * before it gets copied into s_current (under the mutex) - kept separate
+ * from s_current itself so a reader can never observe a partially-built
+ * candidate. */
+static nowplaying_info_t *s_current;
 static TickType_t s_updated_tick;
 
-esp_err_t nowplaying_init(esp_err_t (*crt_bundle_attach)(void *conf))
+static nowplaying_info_t *s_scratch;
+static char *s_scratch_artist;
+static char *s_scratch_artwork_390;
+static char *s_scratch_artwork_640;
+static char *s_scratch_wxxx_desc;
+static char *s_scratch_wxxx_url;
+static nowplaying_info_t *s_ingest_result;
+
+#define NOWPLAYING_WXXX_DESC_MAX 32
+
+static void *psram_alloc(size_t size)
+{
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        /* Should never happen on this board (8MB PSRAM, this is a few KB
+         * total) - falls back to internal RAM rather than leaving this
+         * module non-functional over what would be a much bigger problem
+         * elsewhere if it ever actually triggered. */
+        ESP_LOGW(TAG, "PSRAM allocation of %u bytes failed; falling back to internal RAM",
+                 (unsigned)size);
+        p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    return p;
+}
+
+esp_err_t nowplaying_init(void)
 {
     if (s_mutex != NULL) {
         return ESP_OK; /* already initialized */
@@ -55,8 +82,24 @@ esp_err_t nowplaying_init(esp_err_t (*crt_bundle_attach)(void *conf))
         ESP_LOGE(TAG, "OOM creating result mutex");
         return ESP_ERR_NO_MEM;
     }
-    s_crt_bundle_attach = crt_bundle_attach;
-    ESP_LOGI(TAG, "Initialized");
+
+    s_current = psram_alloc(sizeof(*s_current));
+    s_scratch = psram_alloc(sizeof(*s_scratch));
+    s_scratch_artist = psram_alloc(NOWPLAYING_SUBTITLE_MAX);
+    s_scratch_artwork_390 = psram_alloc(NOWPLAYING_ART_URL_MAX);
+    s_scratch_artwork_640 = psram_alloc(NOWPLAYING_ART_URL_MAX);
+    s_scratch_wxxx_desc = psram_alloc(NOWPLAYING_WXXX_DESC_MAX);
+    s_scratch_wxxx_url = psram_alloc(NOWPLAYING_ART_URL_MAX);
+    s_ingest_result = psram_alloc(sizeof(*s_ingest_result));
+
+    if (!s_current || !s_scratch || !s_scratch_artist || !s_scratch_artwork_390 ||
+        !s_scratch_artwork_640 || !s_scratch_wxxx_desc || !s_scratch_wxxx_url || !s_ingest_result) {
+        ESP_LOGE(TAG, "OOM allocating now-playing buffers - now-playing display will stay empty "
+                 "(nothing else is affected)");
+        return ESP_ERR_NO_MEM;
+    }
+    memset(s_current, 0, sizeof(*s_current));
+    ESP_LOGI(TAG, "Initialized (PSRAM-backed)");
     return ESP_OK;
 }
 
@@ -257,7 +300,8 @@ static void decode_wxxx_frame(const uint8_t *raw, uint32_t raw_len,
 /* Frame layout for ID3v2.3/2.4 (the only two id3_header_valid() accepts):
  * 4-byte frame id, 4-byte size (synchsafe on 2.4, plain big-endian on 2.3),
  * 2-byte flags, then that many bytes of payload. Walks every frame in one
- * tag, filling `out` from whichever TIT2/TPE1/TALB/WXXX it finds - matches
+ * tag, filling the PSRAM-backed scratch fields (see their own comment for
+ * why not the stack) from whichever TIT2/TPE1/TALB/WXXX it finds - matches
  * tunein_nowplaying.py's _track_from_frames(). Returns true only if a title
  * or artist was actually found (an empty/PRIV-only tag, which every
  * fragment on this stream ALSO carries as a lightweight timestamp ping - see
@@ -266,11 +310,11 @@ static void decode_wxxx_frame(const uint8_t *raw, uint32_t raw_len,
 static bool track_from_id3_tag(const uint8_t *data, uint32_t tag_start, uint32_t major,
                                 uint32_t tag_end, uint32_t data_len, nowplaying_info_t *out)
 {
-    char artwork_390[NOWPLAYING_ART_URL_MAX] = {0};
-    char artwork_640[NOWPLAYING_ART_URL_MAX] = {0};
-    char title[NOWPLAYING_TITLE_MAX] = {0};
-    char artist[NOWPLAYING_SUBTITLE_MAX] = {0};
-    char album[NOWPLAYING_ALBUM_MAX] = {0};
+    s_scratch->title[0] = '\0';
+    s_scratch_artist[0] = '\0';
+    s_scratch->album[0] = '\0';
+    s_scratch_artwork_390[0] = '\0';
+    s_scratch_artwork_640[0] = '\0';
     bool have_title_or_artist = false;
 
     uint32_t limit = tag_end < data_len ? tag_end : data_len;
@@ -291,21 +335,20 @@ static bool track_from_id3_tag(const uint8_t *data, uint32_t tag_start, uint32_t
             break;
         }
         if (strcmp(fid, "TIT2") == 0) {
-            decode_text_frame(data + fstart, fsize, title, sizeof(title));
-            have_title_or_artist = have_title_or_artist || title[0] != '\0';
+            decode_text_frame(data + fstart, fsize, s_scratch->title, sizeof(s_scratch->title));
+            have_title_or_artist = have_title_or_artist || s_scratch->title[0] != '\0';
         } else if (strcmp(fid, "TPE1") == 0) {
-            decode_text_frame(data + fstart, fsize, artist, sizeof(artist));
-            have_title_or_artist = have_title_or_artist || artist[0] != '\0';
+            decode_text_frame(data + fstart, fsize, s_scratch_artist, NOWPLAYING_SUBTITLE_MAX);
+            have_title_or_artist = have_title_or_artist || s_scratch_artist[0] != '\0';
         } else if (strcmp(fid, "TALB") == 0) {
-            decode_text_frame(data + fstart, fsize, album, sizeof(album));
+            decode_text_frame(data + fstart, fsize, s_scratch->album, sizeof(s_scratch->album));
         } else if (strcmp(fid, "WXXX") == 0) {
-            char desc[32];
-            char url[NOWPLAYING_ART_URL_MAX];
-            decode_wxxx_frame(data + fstart, fsize, desc, sizeof(desc), url, sizeof(url));
-            if (strcmp(desc, "artworkURL_390x") == 0) {
-                strncpy(artwork_390, url, sizeof(artwork_390) - 1);
-            } else if (strcmp(desc, "artworkURL_640x") == 0) {
-                strncpy(artwork_640, url, sizeof(artwork_640) - 1);
+            decode_wxxx_frame(data + fstart, fsize, s_scratch_wxxx_desc, NOWPLAYING_WXXX_DESC_MAX,
+                               s_scratch_wxxx_url, NOWPLAYING_ART_URL_MAX);
+            if (strcmp(s_scratch_wxxx_desc, "artworkURL_390x") == 0) {
+                strncpy(s_scratch_artwork_390, s_scratch_wxxx_url, NOWPLAYING_ART_URL_MAX - 1);
+            } else if (strcmp(s_scratch_wxxx_desc, "artworkURL_640x") == 0) {
+                strncpy(s_scratch_artwork_640, s_scratch_wxxx_url, NOWPLAYING_ART_URL_MAX - 1);
             }
         }
         fp = fend;
@@ -315,20 +358,20 @@ static bool track_from_id3_tag(const uint8_t *data, uint32_t tag_start, uint32_t
         return false;
     }
 
-    strncpy(out->title, title, sizeof(out->title) - 1);
+    strncpy(out->title, s_scratch->title, sizeof(out->title) - 1);
     out->title[sizeof(out->title) - 1] = '\0';
     /* Same precedence as tunein_nowplaying.py's display_fields(): artist,
      * falling back to album, for the subtitle line. */
-    const char *subtitle_src = artist[0] != '\0' ? artist : album;
+    const char *subtitle_src = s_scratch_artist[0] != '\0' ? s_scratch_artist : s_scratch->album;
     strncpy(out->subtitle, subtitle_src, sizeof(out->subtitle) - 1);
     out->subtitle[sizeof(out->subtitle) - 1] = '\0';
-    strncpy(out->album, album, sizeof(out->album) - 1);
+    strncpy(out->album, s_scratch->album, sizeof(out->album) - 1);
     out->album[sizeof(out->album) - 1] = '\0';
     /* Same precedence as tunein_nowplaying.py's display_fields(): the
      * smaller "_390x" artwork is what the TuneIn web player's own
      * #playerArtwork actually renders, so it is preferred here too when
      * present, falling back to the larger "_640x" one. */
-    const char *art_src = artwork_390[0] != '\0' ? artwork_390 : artwork_640;
+    const char *art_src = s_scratch_artwork_390[0] != '\0' ? s_scratch_artwork_390 : s_scratch_artwork_640;
     strncpy(out->art_url, art_src, sizeof(out->art_url) - 1);
     out->art_url[sizeof(out->art_url) - 1] = '\0';
     return true;
@@ -337,10 +380,10 @@ static bool track_from_id3_tag(const uint8_t *data, uint32_t tag_start, uint32_t
 /* Scans `data` for every valid ID3v2 tag and keeps the LAST one that yields
  * a title/artist (matching tunein_nowplaying.py's own
  * `for frames in reversed(parse_id3_tags(seg_data))` - taking the tag
- * closest to the end of what was fetched, i.e. the most recent). On this
- * stream every tag within one segment's prefix is an identical repeat of
- * the same track (see seg.mp4), so which one wins rarely matters in
- * practice - this only matters on a genuine mid-buffer track change. */
+ * closest to the end of what was fetched, i.e. the most recent). An emsg
+ * box on this stream carries exactly one tag in practice, so this rarely
+ * has more than one candidate to choose from at all - kept general anyway
+ * since nothing about it assumes otherwise. */
 static bool find_latest_track(const uint8_t *data, uint32_t data_len, nowplaying_info_t *out)
 {
     bool found_any = false;
@@ -366,9 +409,7 @@ static bool find_latest_track(const uint8_t *data, uint32_t data_len, nowplaying
         uint32_t major = data[idx + 3];
         uint32_t size = synchsafe(data + idx + 6);
         uint32_t tag_end = idx + 10 + size;
-        nowplaying_info_t candidate = {0};
-        if (track_from_id3_tag(data, idx, major, tag_end, data_len, &candidate)) {
-            *out = candidate;
+        if (track_from_id3_tag(data, idx, major, tag_end, data_len, out)) {
             found_any = true;
         }
         pos = tag_end > idx ? tag_end : idx + 3;
@@ -376,212 +417,45 @@ static bool find_latest_track(const uint8_t *data, uint32_t data_len, nowplaying
     return found_any;
 }
 
-/* ---- m3u8 media-playlist scan - deliberately not reusing ESP-ADF's own
- * private hls_playlist parser, same reasoning and same technique as
- * playlist_prefetch.c's parse_media_playlist() (see its own comment) - just
- * keeping the LAST segment URI found instead of every one, since that is
- * the one currently airing. Segment URIs on this stream are always
- * absolute (see tools/tunin test/variant.m3u8), so no base-URL join is
- * needed the way tunein_nowplaying.py's urllib.parse.urljoin() does. ---- */
-static char *parse_last_segment_uri(char *text)
+void nowplaying_ingest_id3_tag(const uint8_t *data, size_t len)
 {
-    char *saveptr = NULL;
-    char *line = strtok_r(text, "\r\n", &saveptr);
-    bool want_uri = false;
-    char *last = NULL;
-
-    while (line != NULL) {
-        if (want_uri) {
-            if (line[0] != '\0' && line[0] != '#') {
-                char *copy = strdup(line);
-                if (copy) {
-                    free(last);
-                    last = copy;
-                }
-            }
-            want_uri = false;
-        } else if (strncmp(line, "#EXTINF", 7) == 0) {
-            want_uri = true;
-        }
-        line = strtok_r(NULL, "\r\n", &saveptr);
+    if (!data || len == 0) {
+        return;
     }
-    return last;
-}
-
-/* One GET, optionally Range-limited, into `buf` (capacity `buf_cap`,
- * NUL-terminated on return so it can double as a C string for the playlist
- * case). Same open/fetch_headers/bounded-read-loop shape as
- * playlist_prefetch_task() - see that function's comment for why this isn't
- * esp_http_client_perform() with an event handler (tunein_control.c's own
- * http_get() style): a fixed-size destination buffer needs a bounded read
- * loop, not an unbounded event-driven append. */
-static esp_err_t fetch_url(const char *url, int range_bytes, uint8_t *buf, size_t buf_cap, int *out_len)
-{
-    *out_len = 0;
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .timeout_ms = NOWPLAYING_HTTP_TIMEOUT_MS,
-        .buffer_size = 2048,
-        .buffer_size_tx = 512,
-        .keep_alive_enable = false,
-        .crt_bundle_attach = s_crt_bundle_attach,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) {
-        ESP_LOGE(TAG, "esp_http_client_init failed (OOM?)");
-        return ESP_ERR_NO_MEM;
+    if (!s_scratch || !s_scratch_artist || !s_scratch_artwork_390 || !s_scratch_artwork_640 ||
+        !s_scratch_wxxx_desc || !s_scratch_wxxx_url || !s_ingest_result) {
+        return; /* nowplaying_init() never called, or its PSRAM allocation failed */
     }
-    if (range_bytes > 0) {
-        char range_hdr[32];
-        snprintf(range_hdr, sizeof(range_hdr), "bytes=0-%d", range_bytes - 1);
-        esp_http_client_set_header(client, "Range", range_hdr);
+    memset(s_ingest_result, 0, sizeof(*s_ingest_result));
+    if (!find_latest_track(data, (uint32_t)len, s_ingest_result)) {
+        ESP_LOGD(TAG, "emsg box carried no title/artist (a timestamp ping, most likely) - "
+                 "keeping last known track");
+        return;
     }
+    s_ingest_result->valid = true;
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return err;
+    if (!s_mutex || !s_current) {
+        return;
     }
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    /* 206 = Partial Content, the expected reply to our Range request; 200 =
-     * the server ignored Range and is sending the whole body anyway (still
-     * fine - the bounded read loop below just takes the first buf_cap-1
-     * bytes of it, which is all this module ever needed in the first
-     * place). Anything else (403/404/expired signed URL, ...) is a real
-     * failure. */
-    if (status != 200 && status != 206) {
-        ESP_LOGW(TAG, "GET %s -> HTTP %d", url, status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        *s_current = *s_ingest_result;
+        s_updated_tick = xTaskGetTickCount();
+        xSemaphoreGive(s_mutex);
     }
-
-    int total = 0;
-    while ((size_t)total < buf_cap - 1) {
-        int r = esp_http_client_read(client, (char *)buf + total, (int)(buf_cap - 1 - (size_t)total));
-        if (r <= 0) {
-            break;
-        }
-        total += r;
-    }
-    buf[total] = '\0';
-    *out_len = total;
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    return ESP_OK;
-}
-
-static void nowplaying_task(void *arg)
-{
-    char *playlist_url = (char *)arg;
-    uint8_t *buf = heap_caps_malloc(NOWPLAYING_FETCH_BUF_BYTES, MALLOC_CAP_8BIT);
-    char *segment_url = NULL;
-    nowplaying_info_t track = {0};
-    bool have_track = false;
-
-    if (!buf) {
-        ESP_LOGW(TAG, "OOM allocating %d-byte fetch buffer; skipping this poll",
-                 NOWPLAYING_FETCH_BUF_BYTES);
-        goto done;
-    }
-
-    {
-        int playlist_len = 0;
-        esp_err_t err = fetch_url(playlist_url, 0, buf, NOWPLAYING_FETCH_BUF_BYTES, &playlist_len);
-        if (err != ESP_OK || playlist_len == 0) {
-            ESP_LOGW(TAG, "Could not fetch now-playing playlist (%s); skipping this poll",
-                     esp_err_to_name(err));
-            goto done;
-        }
-        segment_url = parse_last_segment_uri((char *)buf);
-        if (!segment_url) {
-            ESP_LOGW(TAG, "No segment URI found in now-playing playlist; skipping this poll");
-            goto done;
-        }
-    }
-
-    {
-        int seg_len = 0;
-        esp_err_t err = fetch_url(segment_url, NOWPLAYING_FETCH_BUF_BYTES - 1, buf,
-                                   NOWPLAYING_FETCH_BUF_BYTES, &seg_len);
-        if (err != ESP_OK || seg_len == 0) {
-            ESP_LOGW(TAG, "Could not fetch segment prefix for now-playing (%s); skipping this poll",
-                     esp_err_to_name(err));
-            goto done;
-        }
-        have_track = find_latest_track(buf, (uint32_t)seg_len, &track);
-        if (!have_track) {
-            ESP_LOGD(TAG, "No ID3 track metadata found in this segment's prefix; keeping last known track");
-        }
-    }
-
-done:
-    if (have_track) {
-        track.valid = true;
-        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            s_current = track;
-            s_updated_tick = xTaskGetTickCount();
-            xSemaphoreGive(s_mutex);
-        }
-        ESP_LOGI(TAG, "Now playing: '%s' - '%s' (album '%s')%s",
-                 track.title, track.subtitle, track.album,
-                 track.art_url[0] ? "" : " [no artwork in this tag]");
-    }
-
-    ESP_LOGD(TAG, "nowplaying task stack high-water mark: %u bytes",
-             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
-
-    free(segment_url);
-    if (buf) {
-        heap_caps_free(buf);
-    }
-    free(playlist_url);
-    s_in_flight = false;
-    vTaskDelete(NULL);
-}
-
-esp_err_t nowplaying_poll_start(const char *hls_media_playlist_url)
-{
-    if (!s_mutex || !hls_media_playlist_url) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (s_in_flight) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    char *url_copy = strdup(hls_media_playlist_url);
-    if (!url_copy) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_in_flight = true; /* set before create - same reasoning as playlist_prefetch_start() */
-    BaseType_t created = xTaskCreate(nowplaying_task, "nowplaying",
-                                      NOWPLAYING_TASK_STACK_BYTES,
-                                      url_copy, NOWPLAYING_TASK_PRIORITY, NULL);
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate failed (free heap=%" PRIu32 ")", esp_get_free_heap_size());
-        free(url_copy);
-        s_in_flight = false;
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-bool nowplaying_is_in_flight(void)
-{
-    return s_in_flight;
+    ESP_LOGI(TAG, "Now playing: '%s' - '%s' (album '%s')%s",
+             s_ingest_result->title, s_ingest_result->subtitle, s_ingest_result->album,
+             s_ingest_result->art_url[0] ? "" : " [no artwork in this tag]");
 }
 
 void nowplaying_get_current(nowplaying_info_t *out)
 {
     if (!out) return;
     memset(out, 0, sizeof(*out));
-    if (!s_mutex) {
+    if (!s_mutex || !s_current) {
         return;
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        *out = s_current;
+        *out = *s_current;
         TickType_t now = xTaskGetTickCount();
         out->age_ms = out->valid ? (uint32_t)((now - s_updated_tick) * portTICK_PERIOD_MS) : 0;
         xSemaphoreGive(s_mutex);
@@ -590,11 +464,11 @@ void nowplaying_get_current(nowplaying_info_t *out)
 
 void nowplaying_reset(void)
 {
-    if (!s_mutex) {
+    if (!s_mutex || !s_current) {
         return;
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        memset(&s_current, 0, sizeof(s_current));
+        memset(s_current, 0, sizeof(*s_current));
         s_updated_tick = xTaskGetTickCount();
         xSemaphoreGive(s_mutex);
     }

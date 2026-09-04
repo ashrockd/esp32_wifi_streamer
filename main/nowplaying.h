@@ -1,54 +1,76 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
 
 /*
- * nowplaying - background poller for the CURRENTLY PLAYING track's title/
- * artist/album/artwork URL, ported from testing-tools/python-script-albumart-
- * title/tunein_nowplaying.py's HLS-embedded-ID3 technique. See that script's
- * own docstring for the full reverse-engineering story; the short version:
- * TuneIn's own REST/GraphQL now-playing endpoints only ever return the
- * STATION's name/tagline for these Apple Music-curated stations, never the
- * actual track - the real per-track title/artist/album/artwork instead rides
- * along AS ID3v2 tags embedded directly in the HLS audio stream itself
- * (the same "timed metadata" mechanism hls.js/AVPlayer surface client-side),
- * re-embedded fresh near the start of every ~16s segment.
+ * nowplaying - the CURRENTLY PLAYING track's title/artist/album/artwork URL,
+ * ported from testing-tools/python-script-albumart-title/tunein_nowplaying.py's
+ * HLS-embedded-ID3 technique. See that script's own docstring for the full
+ * reverse-engineering story; the short version: TuneIn's own REST/GraphQL
+ * now-playing endpoints only ever return the STATION's name/tagline for
+ * these Apple Music-curated stations, never the actual track - the real
+ * per-track title/artist/album/artwork instead rides along AS an ID3v2 tag
+ * embedded directly in the HLS audio stream itself (the same "timed
+ * metadata" mechanism hls.js/AVPlayer surface client-side).
  *
- * PORTING NOTE (2026-09-05) - this needed one real fix, not just a language
- * change: the python script's parse_id3_tags() treats ANY occurrence of the
- * literal bytes "ID3" anywhere in the buffer as a tag header. That is safe
- * for a plain HLS/ADTS segment (which is genuinely all the python script had
- * been tested against - see its docstring's step 3), but this project's
- * actual stream is CMAF/fMP4 (see fmp4_bridge.h), and a REAL captured segment
- * (tools/tunin test/seg.mp4) proved that assumption wrong here: the fMP4
- * 'emsg' box wrapping each ID3 tag carries a scheme_id_uri that itself
- * contains the literal substring "ID3" (something like ".../emsg/ID3"),
- * BEFORE the real tag. The python parser's naive scan finds that first,
- * misreads the following bytes as a tag header, computes a garbage
- * synchsafe size, and gives up scanning the rest of the segment entirely -
- * verified directly: running the unmodified python parser against seg.mp4
- * finds zero tags. This C port instead validates every "ID3" match against
- * the actual ID3v2 header shape (major version in the defined 2-4 range,
- * reserved flag bits zero, synchsafe size bytes all < 0x80) before trusting
- * it, and keeps scanning past a false match instead of aborting - confirmed
- * against the same seg.mp4 fixture to correctly recover all 8 repeated
- * copies of the real tag (title/artist/album/artwork all present).
+ * SNIFFED, NOT FETCHED (2026-09-05 redesign) - this module does NOT open any
+ * HTTP/TLS connection of its own. An earlier version did (its own playlist
+ * GET + a Range-limited segment GET, on a separate short-lived task/TLS
+ * session, mirroring playlist_prefetch.c) - which worked, but was real
+ * waste: a THIRD independent TLS session on a project whose whole resource-
+ * pressure history (see RADIO_DMA_FREE_CRITICAL_BYTES/RADIO_HTTP_BUFFER_
+ * BYTES in app_config.h) is about exactly this - concurrent TLS connections
+ * competing for the same tight DMA-capable/internal RAM pool, on top of a
+ * completely redundant fetch of bytes the pipeline is already downloading
+ * for playback. The ID3 tag lives inside an 'emsg' box in the SAME CMAF
+ * segment stream fmp4_bridge.c already parses byte-by-byte to find moof/
+ * mdat - so fmp4_bridge.c now also recognizes 'emsg' boxes, buffers them
+ * (reusing its existing moof buffer - see its own FMP4_MAX_EMSG_BYTES
+ * comment), and calls nowplaying_ingest_id3_tag() below directly, on its own
+ * task, with zero extra network I/O. This module is now pure parsing plus a
+ * small mutex-protected result cache; main.c's periodic status log just
+ * reads whatever the last ingested tag produced via nowplaying_get_current().
  *
- * Threading model, deliberately copied from playlist_prefetch.h (same
- * problem shape - a slow, blocking HTTPS fetch that must never run on
- * anyone else's task): nowplaying_poll_start() spawns ONE short-lived task
- * per call (refusing to start a second while one is already in flight - see
- * nowplaying_is_in_flight()) that does two sequential HTTP fetches (the
- * current HLS media playlist, then a Range-limited prefix of its last
- * segment), parses whatever ID3 tag it finds, and updates the shared result
- * under a mutex before deleting itself. radio_pipeline.c drives when a poll
- * starts (it already owns the playlist URL's lifecycle - see its own
- * service_nowplaying_poll()); main.c's periodic status log just reads
- * whatever the last completed poll produced via nowplaying_get_current(),
- * which never blocks.
+ * PORTING NOTE - the parsing itself needed one real fix, not just a
+ * language change: the python script's parse_id3_tags() treats ANY
+ * occurrence of the literal bytes "ID3" anywhere in the buffer as a tag
+ * header. That is safe for a plain HLS/ADTS segment (which is genuinely all
+ * the python script had been tested against - see its docstring's step 3),
+ * but a REAL captured segment from this project's actual CMAF stream (tools/
+ * tunin test/seg.mp4) proved that assumption wrong here: the emsg box's own
+ * scheme_id_uri field contains the literal substring "ID3" (something like
+ * ".../emsg/ID3"), BEFORE the real tag that follows it in the same box. The
+ * python parser's naive scan finds that first, misreads the following bytes
+ * as a tag header, computes a garbage synchsafe size, and gives up scanning
+ * the rest of the buffer entirely - verified directly: running the
+ * unmodified python parser against seg.mp4 finds zero tags. This C port
+ * instead validates every "ID3" match against the actual ID3v2 header shape
+ * (major version in the defined 2-4 range, reserved flag bits zero,
+ * synchsafe size bytes all < 0x80) before trusting it, and keeps scanning
+ * past a false match instead of aborting - confirmed against the same
+ * seg.mp4 fixture to correctly recover all 8 repeated copies of the real
+ * tag (title/artist/album/artwork all present). Handing the WHOLE buffered
+ * emsg box body (scheme_id_uri text included) to this same validated
+ * scanner, rather than separately parsing emsg's own header fields to find
+ * where message_data starts, is what lets fmp4_bridge.c stay this simple -
+ * the false-positive-tolerant scan already has to handle exactly that text
+ * being present ahead of the real tag.
+ *
+ * Threading model: nowplaying_ingest_id3_tag() is called ONLY from
+ * fmp4_bridge.c's own element task (never concurrently with itself), so its
+ * internal parsing scratch state is not stack-allocated - deliberately, to
+ * keep this cheap on fmp4_bridge's dedicated small task stack
+ * (FMP4_BRIDGE_TASK_STACK) the same way parse_moof() already runs inline on
+ * that same task at a similar per-fragment frequency. It is also NOT plain
+ * `static` (internal RAM): this board has 8MB of PSRAM, so nowplaying.c
+ * allocates its result + scratch buffers from PSRAM instead, once, up
+ * front in nowplaying_init() - see that file's own comment. The shared
+ * result (nowplaying_info_t) IS mutex-protected, because reading it (main.c's
+ * periodic status log) happens from a DIFFERENT task.
  */
 
 /* Real titles/artists/albums observed on this stream run well under 64
@@ -76,58 +98,55 @@ typedef struct {
      * a perfectly normal, valid track (some stations/segments just don't
      * carry artwork), not an error. */
     char     art_url[NOWPLAYING_ART_URL_MAX];
-    /* How long ago (ms) this snapshot was last refreshed by a successful
-     * poll, filled in by nowplaying_get_current() from its own clock - NOT
-     * stored alongside the fields above. Lets a caller tell "fresh" from
-     * "stale because the last few polls failed" without a separate call. */
+    /* How long ago (ms) this snapshot was last refreshed by a successfully
+     * ingested tag, filled in by nowplaying_get_current() from its own
+     * clock - NOT stored alongside the fields above. Lets a caller tell
+     * "fresh" from "stale because no new tag has come in for a while"
+     * without a separate call. */
     uint32_t age_ms;
 } nowplaying_info_t;
 
 /**
  * One-time setup: creates the result mutex. Idempotent - a second call is a
- * no-op returning ESP_OK. Safe to call before Wi-Fi is even up; nothing here
- * touches the network.
- *
- * @param crt_bundle_attach  Passed straight to both of the poll task's own
- *                            esp_http_client_config_t instances (playlist
- *                            fetch, then segment fetch) - same bundle every
- *                            other HTTPS request in this project uses.
+ * no-op returning ESP_OK. Nothing here touches the network (there is none
+ * to touch any more - see this file's header comment).
  */
-esp_err_t nowplaying_init(esp_err_t (*crt_bundle_attach)(void *conf));
+esp_err_t nowplaying_init(void);
 
 /**
- * Starts a background fetch+parse of the CURRENT track playing on the HLS
- * stream `hls_media_playlist_url` resolves to, if one is not already in
- * flight. `hls_media_playlist_url` is copied (the caller's own copy - e.g.
- * radio_pipeline.c's cached_playlist_url - may change or be freed the
- * moment this returns; ownership is never shared).
+ * Parses `data` (the fully-buffered body of one 'emsg' box - see
+ * fmp4_bridge.c's FMP4_MAX_EMSG_BYTES comment for exactly what calls this
+ * and with what) for an ID3v2 tag, and updates the shared "current track"
+ * result if one is found. A safe, cheap no-op if none is found (most emsg
+ * boxes on this stream are lightweight timing pings with no title/artist -
+ * see nowplaying.h's own PORTING NOTE) - the previous result is left
+ * untouched rather than cleared, so a station's last known track survives
+ * however many pings arrive between real metadata tags.
  *
- * @return ESP_OK if a task was started; ESP_ERR_INVALID_STATE if one was
- *         already running or nowplaying_init() was never called;
- *         ESP_ERR_NO_MEM on allocation failure.
+ * ONLY ever called from fmp4_bridge.c's own element task - see this file's
+ * header comment on why that lets the parsing scratch state below be plain
+ * static instead of needing its own lock or stack allocation.
  */
-esp_err_t nowplaying_poll_start(const char *hls_media_playlist_url);
-
-/** True while a poll task is currently running. */
-bool nowplaying_is_in_flight(void);
+void nowplaying_ingest_id3_tag(const uint8_t *data, size_t len);
 
 /**
- * Non-blocking: always fills *out with whatever the last completed poll
+ * Non-blocking: always fills *out with whatever the last ingested tag
  * produced (out->valid stays false if none has ever succeeded yet for the
  * current station - see nowplaying_reset()). Safe to call from any task;
- * internally mutex-protected against the poll task updating the same state
- * concurrently.
+ * internally mutex-protected against nowplaying_ingest_id3_tag() updating
+ * the same state concurrently.
  */
 void nowplaying_get_current(nowplaying_info_t *out);
 
 /**
  * Clears the cached track back to "nothing known yet" WITHOUT touching
- * whether a poll is in flight. Call this on any genuine station change (see
- * main.c's radio_task) so a track from the PREVIOUS station can never be
- * misread as still describing the new one for the ~20-30s until the next
- * poll completes - deliberately NOT called on every routine same-station
- * session refresh (a live-window boundary, a proactive max-session
- * refresh), where the last known track is still perfectly valid and
- * clearing it would just flicker the status log for no reason.
+ * anything else. Call this on any genuine station change (see main.c's
+ * radio_task) so a track from the PREVIOUS station can never be misread as
+ * still describing the new one for however long it takes the new station's
+ * first metadata-carrying tag to arrive - deliberately NOT called on every
+ * routine same-station session refresh (a live-window boundary, a
+ * proactive max-session refresh), where the last known track is still
+ * perfectly valid and clearing it would just flicker the status log for no
+ * reason.
  */
 void nowplaying_reset(void);

@@ -30,7 +30,6 @@
 #include "console_cli.h"
 #include "fmp4_bridge.h"
 #include "led_viz.h"
-#include "nowplaying.h"
 #include "playlist_prefetch.h"
 #include "tunein_control.h"
 
@@ -105,17 +104,6 @@ static char *cached_playlist_url;
 #define PLAYLIST_PREFETCH_MAX_ATTEMPTS_PER_WINDOW 2
 static TickType_t next_prefetch_retry_tick;
 static int prefetch_attempts_this_window;
-
-/* now-playing (title/artist/album/artwork) polling - see nowplaying.h. Not
- * time-critical the way the prefetcher above is (nothing in the audio path
- * depends on it), so this just re-polls on a plain fixed interval rather
- * than needing live-window-boundary awareness: a bit under one segment
- * duration (~16s - see RADIO_STATIONS' station_list.h comment) so a track
- * change is picked up within roughly one segment of it actually starting,
- * without polling so often that it competes for TLS/heap headroom with the
- * pipeline's own connections and the prefetcher above. */
-#define NOWPLAYING_POLL_INTERVAL_MS 15000
-static TickType_t next_nowplaying_poll_tick;
 
 static int http_stream_hook(http_stream_event_msg_t *msg)
 {
@@ -346,15 +334,6 @@ static esp_err_t switch_cmaf_station_in_place(tunein_session_t *session)
     }
     prefetch_attempts_this_window = 0;
     next_prefetch_retry_tick = 0;
-    /* Poll for the (possibly new) station's track right away rather than
-     * waiting out whatever was left of the OLD station's poll interval -
-     * harmless even on a same-station refresh (just an extra, slightly
-     * early poll of a track that is probably still the same one). Does NOT
-     * clear the currently-displayed track itself (nowplaying_reset()) -
-     * that decision belongs to main.c's radio_task, which is the only place
-     * that actually knows "same station refreshed" from "genuinely switched
-     * station" (this function runs for both). */
-    next_nowplaying_poll_tick = 0;
 
     audio_element_set_uri(http_reader, session->hls_variant_url);
     tunein_log_url("ADF input URI (in-place station switch)", session->hls_variant_url, false);
@@ -845,30 +824,6 @@ static void service_playlist_prefetch(void)
     }
 }
 
-/* now-playing polling, driven from radio_pipeline_wait()'s own loop exactly
- * like service_playlist_prefetch() above - this module owns cached_
- * playlist_url's lifecycle, so it is what starts each poll (nowplaying.c
- * itself does not know or care where the URL comes from). Best-effort and
- * silent on failure the same way: a poll that fails or finds nothing just
- * leaves whatever nowplaying_get_current() last returned in place (see
- * nowplaying.h) - never a reason to disturb playback. */
-static void service_nowplaying_poll(void)
-{
-    if (!cached_playlist_url || nowplaying_is_in_flight()) {
-        return;
-    }
-    TickType_t now = xTaskGetTickCount();
-    if ((int32_t)(now - next_nowplaying_poll_tick) < 0) {
-        return; /* not due yet */
-    }
-    if (nowplaying_poll_start(cached_playlist_url) == ESP_OK) {
-        next_nowplaying_poll_tick = now + pdMS_TO_TICKS(NOWPLAYING_POLL_INTERVAL_MS);
-    }
-    /* On a failed start (OOM/already-in-flight-raced), leave next_nowplaying_
-     * poll_tick as it was - the very next ~1s loop pass just tries again,
-     * same as any other transient failure this loop already tolerates. */
-}
-
 esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd, bool *out_calibrate)
 {
     if (!event_iface) {
@@ -950,7 +905,6 @@ esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_sta
         }
 
         service_playlist_prefetch();
-        service_nowplaying_poll();
 
         TickType_t wait_ticks = prefetch_poll_ticks;
         if (has_deadline) {
@@ -1154,7 +1108,6 @@ void radio_pipeline_stop(void)
     cached_playlist_url = NULL;
     prefetch_attempts_this_window = 0;
     next_prefetch_retry_tick = 0;
-    next_nowplaying_poll_tick = 0;
 
     if (!pipeline) return;
     ESP_LOGW(TAG, "Stopping audio pipeline for refresh/recovery");
