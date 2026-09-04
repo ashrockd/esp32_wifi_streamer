@@ -824,33 +824,68 @@ esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_sta
              * elements re-fetches the playlist, picks up the newly published
              * segments, and continues - a ~1-2 s gap instead of 10-15 s.
              * fmp4_bridge keeps its parsed AudioSpecificConfig across close(),
-             * so the decoder stays correctly configured too. */
-            ESP_LOGI(TAG, "HLS live window exhausted; restarting pipeline in place "
-                     "(no TuneIn re-resolve), free heap=%" PRIu32, esp_get_free_heap_size());
-            audio_pipeline_stop(pipeline);
-            audio_pipeline_wait_for_stop(pipeline);
-            audio_pipeline_reset_ringbuffer(pipeline);
-            audio_pipeline_reset_elements(pipeline);
-            audio_pipeline_change_state(pipeline, AEL_STATE_INIT);
-            esp_err_t rerun = audio_pipeline_run(pipeline);
-            /* audio_pipeline_stop()/wait_for_stop() above make every element
-             * (hls/fmp4/aac/i2s) pass through its own normal stop sequence,
-             * and audio_element.c reports AEL_STATUS_STATE_STOPPED to this
-             * same event_iface as part of that - see audio_element_report_status()
-             * calls guarding AEL_STATE_STOPPED in audio_element.c. Those are
-             * self-inflicted echoes of the stop we just issued, not a new
-             * failure, but nothing above drains them before the loop goes
-             * back to audio_event_iface_listen() - so the very next iteration
-             * was reading a STALE queued status (observed on hardware: hls
-             * status=14/STATE_STOPPED landing in the SAME log line as
-             * "Pipeline started"), is_terminal_status() called it terminal,
-             * and radio_pipeline_wait() returned ESP_FAIL - which sends
-             * main.c through a full TuneIn re-resolve (~12 s of silence,
-             * confirmed in a hardware log) on every single live-window
-             * boundary, exactly the cost this in-place restart exists to
-             * avoid. Discard whatever queued up during the stop/reset/rerun
-             * sequence so only events from the freshly-running pipeline are
-             * seen from here on. */
+             * so the decoder stays correctly configured too.
+             *
+             * 2026-09-04: narrowed from a whole-pipeline audio_pipeline_stop()
+             * / reset / audio_pipeline_run() to touching ONLY http_reader and
+             * fmp4_bridge_el - see [[esp32-wifi-streamer-aac-heap-crash]].
+             * The whole-pipeline version called audio_pipeline_stop() on
+             * every registered element, including decoder_el - which runs
+             * THIS element's close() callback, aac_dec_close() ->
+             * esp_aac_dec_close() -> PVMP4AudioDecoderDeInit() -> free(), a
+             * closed-source ESP-ADF-libs call proven on hardware (5 separate
+             * crashes, each addr2line-confirmed to this exact chain) to
+             * corrupt the heap on close on this build. That call is
+             * completely unnecessary here: the stream format (48kHz/2ch
+             * AAC-LC) never changes across a live-window boundary, so
+             * decoder_el and i2s_writer don't need to be touched at all -
+             * they simply block on their input ring buffer while http_reader
+             * is between fetches, exactly like any ordinary segment-to-
+             * segment gap. Only http_reader (has to re-fetch the playlist)
+             * and fmp4_bridge_el (its box/fragment parser state is tied to
+             * the specific byte stream that just ended) need to reset; both
+             * of their close() callbacks are plain project code with no
+             * closed-source calls in them, so this can never reach the
+             * decoder-close crash. The "fmp4" ring buffer sits between
+             * fmp4_bridge_el and decoder_el and is reset below along with
+             * "hls" - decoder_el itself is never stopped, so it just blocks
+             * until fresh ADTS bytes appear there again. */
+            ESP_LOGI(TAG, "HLS live window exhausted; restarting HLS reader + fMP4 bridge in place "
+                     "(decoder/I2S left running, not closed), free heap=%" PRIu32, esp_get_free_heap_size());
+            audio_element_stop(http_reader);
+            audio_element_wait_for_stop(http_reader);
+            audio_element_reset_input_ringbuf(http_reader);
+            audio_element_reset_output_ringbuf(http_reader);
+            audio_element_reset_state(http_reader);
+            if (fmp4_bridge_el) {
+                audio_element_stop(fmp4_bridge_el);
+                audio_element_wait_for_stop(fmp4_bridge_el);
+                audio_element_reset_input_ringbuf(fmp4_bridge_el);
+                audio_element_reset_output_ringbuf(fmp4_bridge_el);
+                audio_element_reset_state(fmp4_bridge_el);
+            }
+            /* Same run()-then-resume() sequence audio_pipeline_run() itself
+             * uses internally for every element (see esp-adf's
+             * audio_pipeline.c) - reproduced here for just these two. */
+            esp_err_t rerun = audio_element_run(http_reader);
+            if (rerun == ESP_OK && fmp4_bridge_el) {
+                rerun = audio_element_run(fmp4_bridge_el);
+            }
+            if (rerun == ESP_OK) {
+                rerun = audio_element_resume(http_reader, 0, pdMS_TO_TICKS(2000));
+            }
+            if (rerun == ESP_OK && fmp4_bridge_el) {
+                rerun = audio_element_resume(fmp4_bridge_el, 0, pdMS_TO_TICKS(2000));
+            }
+            /* audio_element_stop()/wait_for_stop() above make http_reader and
+             * fmp4_bridge_el report AEL_STATUS_STATE_STOPPED to this same
+             * event_iface as part of their own normal stop sequence - self-
+             * inflicted echoes of the stop just issued, not a new failure
+             * (this is what used to send is_terminal_status() a stale
+             * status and force a full TuneIn re-resolve on every boundary -
+             * see git history). decoder_el/i2s_writer were never stopped, so
+             * unlike the old whole-pipeline version there are only two
+             * elements' worth of echoes to drain here, not four. */
             audio_event_iface_discard(event_iface);
             if (rerun != ESP_OK) {
                 ESP_LOGW(TAG, "In-place restart failed (%s); falling back to a full session refresh",

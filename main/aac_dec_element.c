@@ -138,31 +138,30 @@ static esp_err_t aac_dec_close(audio_element_handle_t self)
 {
     aac_dec_t *d = (aac_dec_t *)audio_element_getdata(self);
     if (d && d->opened) {
-        /* 2026-09-04, TEMPORARY DIAGNOSTIC - the decisive check. Four real
-         * hardware crashes so far all land inside esp_aac_dec_close() ->
-         * PVMP4AudioDecoderDeInit() -> free(), but NEITHER of this file's
-         * other two checks (right after open, and every ~50 decode calls)
-         * has ever fired first - meaning the heap was still clean at least
-         * up through the last periodic check, tens of calls before this
-         * point. This closes that remaining blind spot directly: checked
-         * HERE, before esp_aac_dec_close() runs at all, this either (a)
-         * fails, proving the heap is ALREADY corrupt the instant close() is
-         * entered - meaning something OTHER than esp_aac_dec_close() itself
-         * did the damage (a handful of decode calls this file's own
-         * per-50-call sampling missed, or something concurrent in the
-         * teardown sequence - e.g. fmp4_bridge's on_cmd_error path running
-         * on a different task at roughly the same moment, both triggered by
-         * the same audio_pipeline_stop() call) - or (b) passes, proving the
-         * corruption happens strictly INSIDE esp_aac_dec_close() itself, on
-         * every single call, which would make this a highly reproducible,
-         * fully closed-source-library-internal bug rather than a rare or
-         * external one. Either answer is decisive; remove alongside every
-         * other TEMPORARY DIAGNOSTIC in this project once a fix lands. */
-        if (!heap_caps_check_integrity_all(true)) {
-            ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED before esp_aac_dec_close() was even called - "
-                     "something ELSE corrupted it first, not esp_aac_dec_close() itself");
-        }
-        esp_aac_dec_close(d->dec);
+        /* 2026-09-04: esp_aac_dec_close(d->dec) USED to be called here. The
+         * decisive diagnostic added earlier the same day (a full-heap
+         * integrity check placed immediately before this call) came back
+         * clean on the crash that confirmed it, which rules out this
+         * project's own code corrupting the heap earlier and points squarely
+         * at PVMP4AudioDecoderDeInit() (reached via esp_aac_dec_close() -
+         * see [[esp32-wifi-streamer-aac-heap-crash]] for the five separate
+         * hardware crashes that traced here, every one addr2line-confirmed
+         * to this exact chain) - a bug inside one closed-source ESP-ADF-libs
+         * call, not reachable or fixable from project code.
+         *
+         * Deliberately no longer calling it. d->dec, and whatever internal
+         * buffers PVMP4AudioDecoderDeInit() would have freed (~125KB per
+         * open() - see AAC_DEC_PCM_BYTES's history), are abandoned here
+         * instead of freed: a small, bounded PSRAM leak per teardown, traded
+         * on purpose for never risking the heap-corruption crash that
+         * otherwise takes down the whole board. This element's close() is
+         * now reached only on a real station change, `cal`, or a session-max
+         * refresh - the far more frequent HLS live-window boundary no
+         * longer tears the decoder down at all (see radio_pipeline.c's
+         * in-place restart), so the leak rate here is bounded by how often
+         * someone actually changes stations, not by a ~2-minute timer.
+         * Fully closing this leak needs a fix inside PVMP4AudioDecoderDeInit()
+         * itself, i.e. upstream in ESP-ADF/esp-adf-libs. */
         d->dec = NULL;
         d->opened = false;
         d->in_fill = 0;
@@ -174,8 +173,16 @@ static esp_err_t aac_dec_destroy(audio_element_handle_t self)
 {
     aac_dec_t *d = (aac_dec_t *)audio_element_getdata(self);
     if (d) {
+        /* In every real code path aac_dec_close() above already ran first
+         * (audio_pipeline_stop()/audio_element_stop() before
+         * audio_element_deinit() - see radio_pipeline_stop()) and left
+         * d->opened false, so this is normally a no-op. Kept as a second
+         * line of defense with the identical fix as close() above - never
+         * call esp_aac_dec_close() - should destroy() ever be reached with
+         * d->opened still true. */
         if (d->opened) {
-            esp_aac_dec_close(d->dec);
+            d->dec = NULL;
+            d->opened = false;
         }
         if (d->in_buf) {
             audio_free(d->in_buf);
