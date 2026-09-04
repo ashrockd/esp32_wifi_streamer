@@ -151,22 +151,69 @@ static esp_err_t aac_dec_close(audio_element_handle_t self)
          *
          * Deliberately no longer calling it. d->dec, and whatever internal
          * buffers PVMP4AudioDecoderDeInit() would have freed (~125KB per
-         * open() - see AAC_DEC_PCM_BYTES's history), are abandoned here
-         * instead of freed: a small, bounded PSRAM leak per teardown, traded
-         * on purpose for never risking the heap-corruption crash that
-         * otherwise takes down the whole board. This element's close() is
-         * now reached only on a real station change, `cal`, or a session-max
-         * refresh - the far more frequent HLS live-window boundary no
-         * longer tears the decoder down at all (see radio_pipeline.c's
-         * in-place restart), so the leak rate here is bounded by how often
-         * someone actually changes stations, not by a ~2-minute timer.
-         * Fully closing this leak needs a fix inside PVMP4AudioDecoderDeInit()
-         * itself, i.e. upstream in ESP-ADF/esp-adf-libs. */
+         * open(), some portion possibly DMA-capable RAM rather than pure
+         * PSRAM - see [[esp32-wifi-streamer-aac-heap-crash]]'s later
+         * update), are abandoned here instead of freed.
+         *
+         * 2026-09-04, later the same day: this element itself is now
+         * PERSISTENT across sessions (radio_pipeline.c's aac_decoder - see
+         * its declaration comment and switch_cmaf_station_in_place()),
+         * reused via aac_dec_element_reconfigure() instead of being
+         * recreated every station change/session refresh. That is the real
+         * fix for the leak this comment used to just accept as "bounded" -
+         * this function now only runs at all on a genuine profile change
+         * (see aac_dec_element_reconfigure(), never observed in practice)
+         * or the device's actual final shutdown (which for an embedded
+         * radio that runs forever, is never). Kept as a fallback for
+         * exactly that rare case rather than removed, and still never
+         * calls esp_aac_dec_close() even then - fully closing THIS leak
+         * still needs a fix inside PVMP4AudioDecoderDeInit() itself, i.e.
+         * upstream in ESP-ADF/esp-adf-libs, which remains out of reach from
+         * project code (closed-source, no source in the vendored tree). */
         d->dec = NULL;
         d->opened = false;
         d->in_fill = 0;
     }
     return ESP_OK;
+}
+
+bool aac_dec_element_reconfigure(audio_element_handle_t self, int sample_rate,
+                                 int channels, bool no_adts_header)
+{
+    aac_dec_t *d = (aac_dec_t *)audio_element_getdata(self);
+    if (!d) {
+        return false;
+    }
+
+    if (d->cfg.sample_rate == sample_rate && d->cfg.channel == channels &&
+        d->cfg.no_adts_header == no_adts_header) {
+        return false; /* already configured for this format - nothing to do */
+    }
+
+    /* A genuine format change - not observed in practice (every CMAF
+     * station this project has played decodes at 48kHz/2ch/AAC-LC), but
+     * handled correctly rather than assumed away. If the decoder is
+     * currently open, abandon it exactly like aac_dec_close() does above
+     * (same reasoning, see that function's comment: never call
+     * esp_aac_dec_close()) so the next open() call allocates a fresh
+     * instance for the new format instead of silently decoding it with
+     * stale configuration. This is the one remaining case where keeping
+     * this element alive across sessions (radio_pipeline.c) still costs a
+     * leak - but only on an actual profile change, not on every session,
+     * which is the entire point of this function existing. */
+    if (d->opened) {
+        ESP_LOGW(TAG, "Stream format changed (%d Hz/%d ch/adts=%d -> %d Hz/%d ch/adts=%d) - "
+                 "abandoning the open decoder instance for a fresh one, same as close()",
+                 d->cfg.sample_rate, d->cfg.channel, !d->cfg.no_adts_header,
+                 sample_rate, channels, !no_adts_header);
+        d->dec = NULL;
+        d->opened = false;
+        d->in_fill = 0;
+    }
+    d->cfg.sample_rate = sample_rate;
+    d->cfg.channel = (uint8_t)channels;
+    d->cfg.no_adts_header = no_adts_header;
+    return true;
 }
 
 static esp_err_t aac_dec_destroy(audio_element_handle_t self)

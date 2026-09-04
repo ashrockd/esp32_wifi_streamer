@@ -37,11 +37,31 @@ static const char *TAG = "PIPELINE";
 static audio_pipeline_handle_t pipeline;
 static audio_element_handle_t http_reader;
 static audio_element_handle_t fmp4_bridge_el;
+/* 2026-09-04: PERSISTENT across every CMAF session, like bt_writer in the
+ * sibling esp32_bt_speaker project - created once (lazily, on the first
+ * CMAF station ever played), then reused via switch_cmaf_station_in_place()
+ * for every later station change/session refresh, NEVER audio_element_
+ * deinit'd. This is why: aac_dec_close() (aac_dec_element.c) deliberately
+ * never calls esp_aac_dec_close() any more - that call is proven on
+ * hardware to corrupt the heap - and instead abandons the decoder's
+ * internal buffers (~125KB, some portion possibly DMA-capable RAM, not
+ * just PSRAM - see [[esp32-wifi-streamer-aac-heap-crash]]'s later update).
+ * That is a fine, bounded, one-time cost if this element's close() runs
+ * once ever - but every CMAF station played previously recreated this
+ * element from scratch each session, so close() (and the leak) ran on
+ * every single station change and session-max refresh too. Keeping the
+ * SAME element alive across those - closing/reopening only on a genuine
+ * profile change, via aac_dec_element_reconfigure() - means close() now
+ * only ever runs on an actual format change (CMAF -> generic or back) or
+ * final shutdown, not on routine station switching. See radio_pipeline_
+ * start()'s own comment for the decision logic. */
 static audio_element_handle_t aac_decoder;
 /* ESP-ADF's auto-detecting decoder, used instead of fmp4_bridge+aac_decoder
  * for every session->format other than TUNEIN_FORMAT_HLS_CMAF_AAC - see
  * build_generic_decoder(). Exactly one of aac_decoder/generic_decoder is
- * non-NULL while a pipeline is up. */
+ * non-NULL while a pipeline is up. Unlike aac_decoder, this one is NOT
+ * persistent - recreated fresh every session, same as before - it has no
+ * known close()-time corruption bug to work around. */
 static audio_element_handle_t generic_decoder;
 /* Whichever of the two above is actually in the running chain, so the
  * music-info handler, element_name() and teardown do not each have to
@@ -239,8 +259,155 @@ static audio_element_handle_t build_generic_decoder(void)
     return el;
 }
 
+/*
+ * Swaps in a new CMAF station's stream WITHOUT tearing down the pipeline -
+ * called only from radio_pipeline_start() when a live pipeline already
+ * exists, aac_decoder is the running decoder, and the new session is ALSO
+ * CMAF format. This is the whole point of keeping aac_decoder persistent
+ * (see its declaration comment): only http_reader (new URL) and
+ * fmp4_bridge_el (new init segment/AudioSpecificConfig) are stopped/reset/
+ * restarted here, exactly like radio_pipeline_wait()'s own HLS-live-window-
+ * boundary in-place restart - see that code's comments for the full
+ * reasoning on why this never touches decoder_el/i2s_writer's close(), and
+ * therefore never reaches the closed-source esp_aac_dec_close() heap-
+ * corruption bug. decoder_el/i2s_writer are defensively re-run/resumed
+ * anyway (both calls are safe no-ops if already running - confirmed by
+ * reading ESP-ADF's audio_element_run()/on_cmd_resume() directly) to cover
+ * the case where the PREVIOUS session ended with them already stopped (a
+ * self-triggered abort cascade, observed on hardware).
+ *
+ * Returns an error (never partially applied beyond what is already
+ * idempotent-safe to retry) if anything fails, in which case the caller
+ * falls back to a full radio_pipeline_stop()+rebuild - so a failure here
+ * costs a rebuild, not a broken pipeline.
+ */
+static esp_err_t switch_cmaf_station_in_place(tunein_session_t *session)
+{
+    esp_err_t init_err = fmp4_bridge_set_init_segment(fmp4_bridge_el, session->init_segment,
+                                                       session->init_segment_len);
+    if (init_err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not parse new station's CMAF init segment: %s", esp_err_to_name(init_err));
+        return init_err;
+    }
+
+    int new_rate = fmp4_bridge_get_sample_rate(fmp4_bridge_el);
+    int new_ch   = fmp4_bridge_get_channels(fmp4_bridge_el);
+    if (new_rate <= 0 || new_ch <= 0) {
+        ESP_LOGW(TAG, "New station's init segment parsed but reported no usable rate/channels");
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool decoder_format_changed = aac_dec_element_reconfigure(aac_decoder, new_rate, new_ch, false);
+    if (decoder_format_changed) {
+        ESP_LOGW(TAG, "New station's format (%d Hz, %d ch) differs from the previous one - "
+                 "decoder reconfigured (this is the one case that still abandons an old decoder "
+                 "instance, exactly like a full rebuild would have)", new_rate, new_ch);
+    }
+    if (new_rate != i2s_configured_rate || new_ch != i2s_configured_ch) {
+        /* Same situation the music-info handler below normally deals with,
+         * hit here instead because this station's real rate is known up
+         * front. I2S itself is NOT retuned (see RADIO_I2S_SAMPLE_RATE's
+         * comment in app_config.h and the music-info handler's own comment
+         * for why i2s_stream_set_clk() is never called) - logged loudly so
+         * a genuine mismatch is visible rather than silently mis-pitched,
+         * same as that handler's CMAF-anomaly branch. */
+        ESP_LOGW(TAG, "New station reports %d Hz, %d ch but I2S is fixed at %d Hz, %d ch - "
+                 "unexpected on the CMAF path; playback may be mis-pitched until the next full refresh",
+                 new_rate, new_ch, i2s_configured_rate, i2s_configured_ch);
+    }
+
+    /* Discard any prefetch left over from the PREVIOUS station before it can
+     * be mistaken for this new one - same reasoning as radio_pipeline_stop().
+     */
+    playlist_prefetch_reset();
+    free(cached_playlist_url);
+    cached_playlist_url = strdup(session->hls_variant_url);
+    if (!cached_playlist_url) {
+        ESP_LOGW(TAG, "Could not copy playlist URL for prefetching (OOM); "
+                 "live-window boundaries will fall back to the reactive refresh only");
+    }
+    prefetch_attempts_this_window = 0;
+    next_prefetch_retry_tick = 0;
+
+    audio_element_set_uri(http_reader, session->hls_variant_url);
+    tunein_log_url("ADF input URI (in-place station switch)", session->hls_variant_url, false);
+
+    /* Same stop/reset sequence as radio_pipeline_wait()'s own in-place
+     * restart - see its comment for the full reasoning. */
+    audio_element_stop(http_reader);
+    audio_element_wait_for_stop(http_reader);
+    audio_element_reset_input_ringbuf(http_reader);
+    audio_element_reset_output_ringbuf(http_reader);
+    audio_element_reset_state(http_reader);
+    audio_element_stop(fmp4_bridge_el);
+    audio_element_wait_for_stop(fmp4_bridge_el);
+    audio_element_reset_input_ringbuf(fmp4_bridge_el);
+    audio_element_reset_output_ringbuf(fmp4_bridge_el);
+    audio_element_reset_state(fmp4_bridge_el);
+    if (decoder_format_changed) {
+        /* aac_dec_element_reconfigure() just abandoned d->dec (aac_dec_
+         * element.c's own internal decoder-open flag), but that alone does
+         * NOT make decoder_el's audio_element-level state machine re-enter
+         * open() - if it is still sitting at AEL_STATE_RUNNING from before,
+         * audio_element_resume() below would see that and return early
+         * without ever calling open() again, leaving aac_dec_process() to
+         * run against a NULL d->dec. Force the same real stop/reset cycle
+         * as http_reader/fmp4_bridge_el above so its close()/open() actually
+         * re-run - close() here is a no-op given d->opened is already
+         * false (see aac_dec_close()), open() is what allocates the fresh
+         * esp_aac_dec instance for the new format. */
+        audio_element_stop(decoder_el);
+        audio_element_wait_for_stop(decoder_el);
+        audio_element_reset_input_ringbuf(decoder_el);
+        audio_element_reset_output_ringbuf(decoder_el);
+        audio_element_reset_state(decoder_el);
+    }
+
+    esp_err_t rerun = audio_element_run(http_reader);
+    if (rerun == ESP_OK) rerun = audio_element_run(fmp4_bridge_el);
+    /* Defensive - see this function's header comment. */
+    if (rerun == ESP_OK) rerun = audio_element_run(decoder_el);
+    if (rerun == ESP_OK) rerun = audio_element_run(i2s_writer);
+    if (rerun == ESP_OK) rerun = audio_element_resume(http_reader, 0, pdMS_TO_TICKS(2000));
+    if (rerun == ESP_OK) rerun = audio_element_resume(fmp4_bridge_el, 0, pdMS_TO_TICKS(2000));
+    if (rerun == ESP_OK) rerun = audio_element_resume(decoder_el, 0, pdMS_TO_TICKS(2000));
+    if (rerun == ESP_OK) rerun = audio_element_resume(i2s_writer, 0, pdMS_TO_TICKS(2000));
+
+    /* Same stale-STOPPED-status draining as the boundary restart - see its
+     * comment. event_iface is guaranteed non-NULL here (it is only ever
+     * torn down by the full radio_pipeline_stop(), which this path exists
+     * specifically to avoid calling). */
+    audio_event_iface_discard(event_iface);
+
+    if (rerun != ESP_OK) {
+        ESP_LOGW(TAG, "In-place station switch could not restart the pipeline: %s", esp_err_to_name(rerun));
+        return rerun;
+    }
+
+    ESP_LOGI(TAG, "Switched station in place (decoder/I2S kept alive, no full rebuild): "
+             "%d Hz, %d ch, free heap=%" PRIu32, new_rate, new_ch, esp_get_free_heap_size());
+    return ESP_OK;
+}
+
 esp_err_t radio_pipeline_start(tunein_session_t *session)
 {
+    /* The whole reason aac_decoder is persistent (see its declaration
+     * comment): if a pipeline is already up, already CMAF, and the new
+     * station is ALSO CMAF, swap the station in place instead of tearing
+     * everything down and rebuilding - which is what used to force a real
+     * esp_aac_dec_close() (via aac_dec_close()) on every single station
+     * change, not just occasionally. Any other case (no pipeline yet, a
+     * format change, or the in-place attempt itself failing) falls through
+     * to the full rebuild below exactly as before. */
+    if (pipeline && aac_decoder && decoder_el == aac_decoder &&
+        session->format == TUNEIN_FORMAT_HLS_CMAF_AAC) {
+        esp_err_t switch_err = switch_cmaf_station_in_place(session);
+        if (switch_err == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "In-place station switch failed (%s); falling back to a full pipeline rebuild",
+                 esp_err_to_name(switch_err));
+    }
+
     radio_pipeline_stop();
 
     /* Before spending a TuneIn resolve and a segment fetch on it: confirm
@@ -364,15 +531,30 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
          * The rate/channels come from the init segment the session just fetched
          * (fmp4_bridge parsed it as AAC-LC / freq_index=3 / 2ch = 48000 Hz), not
          * from a hardcoded guess. */
-        aac_dec_element_cfg_t dec_cfg = AAC_DEC_ELEMENT_CFG_DEFAULT();
-        dec_cfg.out_rb_size = RADIO_DECODER_BUFFER_BYTES;
-        dec_cfg.sample_rate = fmp4_bridge_get_sample_rate(fmp4_bridge_el);
-        dec_cfg.channels    = fmp4_bridge_get_channels(fmp4_bridge_el);
-        /* fmp4_bridge emits 7-byte ADTS headers, which is also what gives the
-         * decoder frame boundaries across the ring buffer between the two
-         * elements - so ADTS framing stays on. */
-        dec_cfg.no_adts_header = false;
-        aac_decoder = aac_dec_element_init(&dec_cfg);
+        int want_rate = fmp4_bridge_get_sample_rate(fmp4_bridge_el);
+        int want_ch   = fmp4_bridge_get_channels(fmp4_bridge_el);
+        if (aac_decoder) {
+            /* Reached only when switch_cmaf_station_in_place() itself
+             * failed and this full rebuild is the fallback (see
+             * radio_pipeline_start()'s comment) - aac_decoder already
+             * exists and radio_pipeline_stop() above deliberately did NOT
+             * deinit it (see its own declaration comment). Reuse it rather
+             * than orphaning this handle by overwriting it with a second
+             * instance - that would leak the FIRST one's audio_element
+             * object outright (no reference left to ever unregister/deinit
+             * it), on top of whatever esp_aac_dec state it holds. */
+            aac_dec_element_reconfigure(aac_decoder, want_rate, want_ch, false);
+        } else {
+            aac_dec_element_cfg_t dec_cfg = AAC_DEC_ELEMENT_CFG_DEFAULT();
+            dec_cfg.out_rb_size = RADIO_DECODER_BUFFER_BYTES;
+            dec_cfg.sample_rate = want_rate;
+            dec_cfg.channels    = want_ch;
+            /* fmp4_bridge emits 7-byte ADTS headers, which is also what gives
+             * the decoder frame boundaries across the ring buffer between the
+             * two elements - so ADTS framing stays on. */
+            dec_cfg.no_adts_header = false;
+            aac_decoder = aac_dec_element_init(&dec_cfg);
+        }
         decoder_el = aac_decoder;
     } else {
         generic_decoder = build_generic_decoder();
@@ -955,20 +1137,30 @@ void radio_pipeline_stop(void)
     if (fmp4_bridge_el) {
         audio_element_deinit(fmp4_bridge_el);
     }
-    if (decoder_el) {
-        audio_element_deinit(decoder_el);
+    if (generic_decoder) {
+        audio_element_deinit(generic_decoder);
     }
-    /* Unlike the single-chip project's bt_writer, i2s_writer has no
-     * "can only be created once per process" restriction - safe to fully
-     * deinit and recreate fresh every session. */
+    if (aac_decoder) {
+        /* Deliberately NOT audio_element_deinit'd - see its declaration
+         * comment. Kept alive across every full rebuild too (not just the
+         * in-place path), same reasoning as bt_writer in the sibling
+         * esp32_bt_speaker project: reset to AEL_STATE_INIT so the next
+         * radio_pipeline_start() (whichever path it takes) can register
+         * and run it fresh, without needing a new esp_aac_dec_open(). */
+        audio_element_reset_state(aac_decoder);
+    }
+    /* i2s_writer has no "can only be created once per process" restriction
+     * (unlike bt_writer/aac_decoder) - safe to fully deinit and recreate
+     * fresh every session. */
     audio_element_deinit(i2s_writer);
     pipeline = NULL;
     http_reader = NULL;
     fmp4_bridge_el = NULL;
-    aac_decoder = NULL;
     generic_decoder = NULL;
     decoder_el = NULL;
     i2s_writer = NULL;
+    /* aac_decoder is NOT reset to NULL - it persists across every session,
+     * full rebuild or in-place switch alike. */
 
     ESP_LOGI(TAG, "Pipeline torn down; free heap=%" PRIu32, esp_get_free_heap_size());
 }

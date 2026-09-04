@@ -332,7 +332,27 @@ static void radio_task(void *pvParameters)
             err = radio_pipeline_wait(pdMS_TO_TICKS(RADIO_SESSION_MAX_MS), &station_cmd, &calibrate_requested);
         }
 
-        radio_pipeline_stop();
+        /* 2026-09-04: NOT called unconditionally here any more. It used to
+         * be - tearing the whole pipeline down (including decoder_el) the
+         * instant radio_pipeline_wait() returned, for EVERY reason it could
+         * return (station change, clean refresh, real failure alike) -
+         * which defeated radio_pipeline_start()'s own in-place-reuse logic
+         * before it ever got a chance to run: by the time the next loop
+         * iteration called it, `pipeline` was already NULL, so it always
+         * took the full-rebuild path (see radio_pipeline_start()'s comment
+         * and [[esp32-wifi-streamer-aac-heap-crash]]). Only calibration
+         * needs the pipeline gone before the next step, because
+         * latency_cal_run() builds its own separate I2S pipeline right
+         * after this and the two cannot coexist on the same I2S peripheral.
+         * Every other path below loops back around to tunein_start_session()
+         * + radio_pipeline_start() for the next/retried station, which now
+         * decides for itself whether the existing pipeline (still alive,
+         * still playing the OLD station in the background while that
+         * resolve runs) can be reused in place or needs a full rebuild -
+         * and falls back to calling radio_pipeline_stop() itself if not. */
+        if (calibrate_requested) {
+            radio_pipeline_stop();
+        }
 
         ESP_LOGI(
             TAG,

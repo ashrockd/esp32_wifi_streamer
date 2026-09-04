@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "audio_element.h"
 
@@ -59,3 +61,26 @@ typedef struct {
 }
 
 audio_element_handle_t aac_dec_element_init(aac_dec_element_cfg_t *config);
+
+/*
+ * Updates the stream format an ALREADY-CREATED element will use the next
+ * time it opens (i.e. the next time its close()/open() cycle runs) -
+ * without destroying and recreating the element itself. Exists so
+ * radio_pipeline.c can keep ONE decoder element alive across every CMAF
+ * session (station change, proactive refresh) instead of creating a fresh
+ * one every time: esp_aac_dec_close() is proven on hardware to corrupt the
+ * heap (see [[esp32-wifi-streamer-aac-heap-crash]]), so this project's
+ * aac_dec_close() deliberately never calls it and just abandons the old
+ * decoder handle - fine as a one-time cost at boot, but a real leak if it
+ * happens on every session. Reusing the SAME element across sessions means
+ * that only ever happens once, since every CMAF station observed so far
+ * decodes at the exact same 48kHz/2ch/AAC-LC profile and this function is a
+ * no-op when the requested format already matches what is configured - see
+ * its own implementation comment for what happens on the rare case it does
+ * not match (a real profile change, never observed in practice).
+ *
+ * Returns true if the format actually changed (caller may want to log
+ * that), false if it already matched and nothing needed to change.
+ */
+bool aac_dec_element_reconfigure(audio_element_handle_t self, int sample_rate,
+                                 int channels, bool no_adts_header);

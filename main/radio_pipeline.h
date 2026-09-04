@@ -12,7 +12,17 @@
  * the companion esp32_bt_speaker chip can just listen as I2S slave. Returns
  * once the elements are launched; ESP-ADF's own audio_pipeline_run() is
  * non-blocking, so this does not mean playback has finished or even started
- * yet - call radio_pipeline_wait() next. */
+ * yet - call radio_pipeline_wait() next.
+ *
+ * Safe to call with a pipeline already running (radio_pipeline.c no longer
+ * requires the caller to radio_pipeline_stop() first - see main.c's
+ * radio_task() loop, which now only does that explicitly before
+ * calibration). If the existing pipeline is CMAF and `session` is ALSO
+ * CMAF, this swaps the station in place (new URL/init segment only,
+ * decoder/I2S element instances kept alive - see
+ * [[esp32-wifi-streamer-aac-heap-crash]] for why that matters) instead of
+ * a full teardown+rebuild; any other case (no pipeline yet, or a format
+ * change) does the full rebuild as before, transparently to the caller. */
 esp_err_t radio_pipeline_start(tunein_session_t *session);
 
 /*
