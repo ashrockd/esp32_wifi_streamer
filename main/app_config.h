@@ -222,6 +222,14 @@
 #define RADIO_HTTP_BUFFER_BYTES     (256 * 1024)
 #define RADIO_FMP4_BUFFER_BYTES     (64 * 1024)
 #define RADIO_DECODER_BUFFER_BYTES  (64 * 1024)
+/* Only allocated on the generic/fallback decoder path (see resample_el in
+ * radio_pipeline.c) - the CMAF path's stream is already at
+ * RADIO_I2S_SAMPLE_RATE, so it never creates this element at all. Same
+ * order of magnitude as RADIO_DECODER_BUFFER_BYTES for the same reason -
+ * cheap on this board's 8MB PSRAM, and a resampler catching up after a
+ * brief stall is worth more headroom than the stock RSP_FILTER_RINGBUFFER_
+ * SIZE (2KB) default gives it. */
+#define RADIO_RESAMPLE_BUFFER_BYTES (64 * 1024)
 
 /*
  * TuneIn's signed HLS/CMAF URLs are undocumented and short-lived; the app
@@ -315,4 +323,13 @@
 #define RADIO_I2S_BCLK_GPIO         4
 #define RADIO_I2S_WS_GPIO           5
 #define RADIO_I2S_DATA_GPIO         6
-#define RADIO_I2S_SAMPLE_RATE       44100
+/* 2026-09-04: was 44100. I2S is now created at this rate ONCE and never
+ * retuned (see radio_pipeline.c's music-info handler) - every station this
+ * chip actually plays is either 48kHz already (every CMAF/HLS station
+ * observed so far) or gets resampled UP to it by resample_el on the
+ * generic/fallback decoder path (some direct-stream stations, e.g. a
+ * hardware-observed 44.1kHz ".aac" station, are not). 48000 matches the
+ * CMAF path's real rate exactly (so that path's resample-free fast path
+ * stays resample-free) and gives every station one single, predictable
+ * rate crossing the I2S link to the companion esp32_bt_speaker chip. */
+#define RADIO_I2S_SAMPLE_RATE       48000
