@@ -24,6 +24,7 @@
 #include "app_config.h"
 #include "avrcp_uart.h"
 #include "console_cli.h"
+#include "latency_cal.h"
 #include "led_viz.h"
 #include "playlist_prefetch.h"
 #include "radio_pipeline.h"
@@ -291,15 +292,18 @@ static void radio_task(void *pvParameters)
         free(session);
 
         avrcp_cmd_t station_cmd = AVRCP_CMD_NONE;
+        bool calibrate_requested = false;
         if (err == ESP_OK) {
             /* audio_pipeline_run() is non-blocking - it only launches the
              * element tasks - so block here for as long as playback is
              * actually healthy, and only fall through when the pipeline
              * reports an error (e.g. the signed HLS URL expired), the
-             * defensive max session duration elapses, or an AVRCP next/
-             * previous command arrives over UART (avrcp_uart.h). */
-            ESP_LOGI(TAG, "Playback running; watching for pipeline errors, session expiry, or AVRCP next/previous");
-            err = radio_pipeline_wait(pdMS_TO_TICKS(RADIO_SESSION_MAX_MS), &station_cmd);
+             * defensive max session duration elapses, an AVRCP/console next/
+             * previous command arrives (avrcp_uart.h, console_cli.h), or a
+             * console `cal` command requests latency calibration
+             * (latency_cal.h). */
+            ESP_LOGI(TAG, "Playback running; watching for pipeline errors, session expiry, next/previous, or calibration");
+            err = radio_pipeline_wait(pdMS_TO_TICKS(RADIO_SESSION_MAX_MS), &station_cmd, &calibrate_requested);
         }
 
         radio_pipeline_stop();
@@ -309,6 +313,19 @@ static void radio_task(void *pvParameters)
             "radio_task minimum free stack: %u bytes",
             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t))
         );
+
+        /* Checked first, before even the station-change handling below: like
+         * a station change, entering calibration is a deliberate, healthy
+         * end to the session, not a failure. latency_cal_run() owns the
+         * entire interactive flow (see latency_cal.h) and blocks this task
+         * until it's done (accepted or cancelled) - current_station_idx is
+         * untouched, so falling through to `continue` resumes the exact same
+         * station afterward, indistinguishable from an ordinary refresh. */
+        if (calibrate_requested) {
+            latency_cal_run();
+            consecutive_failures = 0;
+            continue;
+        }
 
         /* Checked before the error/backoff handling below: a station change
          * is a deliberate, healthy end to the session, so it must clear the
@@ -363,6 +380,7 @@ void app_main(void)
     esp_log_level_set("AVRCP_UART", ESP_LOG_DEBUG);
     esp_log_level_set("LED_VIZ", ESP_LOG_DEBUG);
     esp_log_level_set("CONSOLE", ESP_LOG_DEBUG);
+    esp_log_level_set("LATENCY_CAL", ESP_LOG_DEBUG);
 
     ESP_LOGI(TAG, "ESP32 Wi-Fi/streamer chip booting (I2S -> esp32_bt_speaker)");
     ESP_LOGI(TAG, "Compiled-in default station=%s (%u stations available; the one actually started is "

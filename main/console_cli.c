@@ -1,5 +1,6 @@
 #include "console_cli.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 
 #include "audio_common.h"
 
+#include "latency_cal.h"
 #include "led_viz.h"
 #include "station_list.h"
 
@@ -95,6 +97,87 @@ static int cmd_led_thresh(int argc, char **argv)
     return 0;
 }
 
+static int cmd_latency(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("LED/audio latency compensation: %" PRId32 "ms\n", led_viz_get_latency_ms());
+        printf("(measure this properly with 'cal' instead of guessing, if you have not already)\n");
+        return 0;
+    }
+
+    char *end = NULL;
+    long ms = strtol(argv[1], &end, 10);
+    if (end == argv[1]) {
+        printf("Usage: latency [ms]   (no argument prints the current value)\n"
+               "  e.g. 'latency 220' - manually sets it; prefer 'cal' for a measured value.\n");
+        return 1;
+    }
+
+    led_viz_set_latency_ms((int32_t)ms);
+    printf("LED/audio latency compensation now %" PRId32 "ms (saved; survives a restart)\n",
+           led_viz_get_latency_ms());
+    return 0;
+}
+
+static int cmd_cal(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (latency_cal_is_active()) {
+        printf("Already in calibration mode.\n");
+        return 0;
+    }
+    printf("Entering LED/audio latency calibration - ending the current session...\n");
+    dispatch_command(CONSOLE_CMD_CAL_ENTER);
+    return 0;
+}
+
+/* beep/heard/accept/cancel only mean anything while latency_cal_run() is
+ * actively draining this queue for them - see console_cli.h's doc comment
+ * on why they must not be enqueued otherwise. */
+static int cmd_cal_beep(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!latency_cal_is_active()) {
+        printf("Not in calibration mode - type 'cal' first.\n");
+        return 1;
+    }
+    dispatch_command(CONSOLE_CMD_CAL_BEEP);
+    return 0;
+}
+
+static int cmd_cal_heard(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!latency_cal_is_active()) {
+        printf("Not in calibration mode - type 'cal' first.\n");
+        return 1;
+    }
+    dispatch_command(CONSOLE_CMD_CAL_HEARD);
+    return 0;
+}
+
+static int cmd_cal_accept(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!latency_cal_is_active()) {
+        printf("Not in calibration mode - nothing to accept.\n");
+        return 1;
+    }
+    dispatch_command(CONSOLE_CMD_CAL_ACCEPT);
+    return 0;
+}
+
+static int cmd_cal_cancel(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!latency_cal_is_active()) {
+        printf("Not in calibration mode - nothing to cancel.\n");
+        return 1;
+    }
+    dispatch_command(CONSOLE_CMD_CAL_CANCEL);
+    return 0;
+}
+
 static int cmd_status(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -106,7 +189,11 @@ static int cmd_status(int argc, char **argv)
     } else {
         printf("Station : none playing yet\n");
     }
-    printf("LED     : peak-brightness threshold %.1f dBFS\n", led_viz_get_threshold_db());
+    printf("LED     : peak-brightness threshold %.1f dBFS, latency compensation %" PRId32 "ms\n",
+           led_viz_get_threshold_db(), led_viz_get_latency_ms());
+    if (latency_cal_is_active()) {
+        printf("          (latency calibration currently in progress - type 'cancel' to abort)\n");
+    }
     return 0;
 }
 
@@ -138,9 +225,57 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&thresh_cmd));
 
+    const esp_console_cmd_t latency_cmd = {
+        .command = "latency",
+        .help = "Get/manually set the LED/audio latency compensation in ms (persists; prefer 'cal')",
+        .hint = "[ms]",
+        .func = &cmd_latency,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&latency_cmd));
+
+    const esp_console_cmd_t cal_cmd = {
+        .command = "cal",
+        .help = "Enter interactive LED/audio latency calibration (see latency_cal.h)",
+        .hint = NULL,
+        .func = &cmd_cal,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cal_cmd));
+
+    const esp_console_cmd_t beep_cmd = {
+        .command = "beep",
+        .help = "(during 'cal' only) play a test tone and start timing",
+        .hint = NULL,
+        .func = &cmd_cal_beep,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&beep_cmd));
+
+    const esp_console_cmd_t heard_cmd = {
+        .command = "heard",
+        .help = "(during 'cal' only) register the instant you heard the test tone",
+        .hint = NULL,
+        .func = &cmd_cal_heard,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&heard_cmd));
+
+    const esp_console_cmd_t accept_cmd = {
+        .command = "accept",
+        .help = "(during 'cal' only) save the measured latency average and resume playback",
+        .hint = NULL,
+        .func = &cmd_cal_accept,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&accept_cmd));
+
+    const esp_console_cmd_t cancel_cmd = {
+        .command = "cancel",
+        .help = "(during 'cal' only) discard calibration and resume playback unchanged",
+        .hint = NULL,
+        .func = &cmd_cal_cancel,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cancel_cmd));
+
     const esp_console_cmd_t status_cmd = {
         .command = "status",
-        .help = "Show the currently playing station and the LED peak-brightness threshold",
+        .help = "Show the currently playing station, LED threshold, and latency compensation",
         .hint = NULL,
         .func = &cmd_status,
     };

@@ -34,8 +34,23 @@
  *                         LED's peak-brightness threshold - see led_viz.h.
  *                         A set applies immediately and persists (NVS),
  *                         surviving a restart.
- *   status             - prints the currently playing station and the LED
- *                         threshold.
+ *   latency [ms]       - get (no argument) or manually set (argument) the
+ *                         LED/audio latency compensation - see led_viz.h's
+ *                         led_viz_set_latency_ms(). A set applies and
+ *                         persists immediately, same as led-thresh. For
+ *                         measuring this properly rather than guessing, see
+ *                         `cal` below.
+ *   cal                - enters interactive LED/audio latency calibration
+ *                         (latency_cal.h) - ends the current session (like
+ *                         next/prev) and hands the console over to a guided
+ *                         beep/heard measurement flow instead of resuming
+ *                         normal playback. Once inside that flow:
+ *                           beep    - play a test tone now
+ *                           heard   - type this the instant you hear it
+ *                           accept  - save the measured average, resume playback
+ *                           cancel  - discard, resume playback unchanged
+ *   status             - prints the currently playing station, the LED
+ *                         threshold, and the latency compensation.
  *
  * Architecture mirrors avrcp_uart.h exactly, as a second, independent
  * source of the same next/previous command: esp_console's own REPL task
@@ -44,11 +59,26 @@
  * wakes radio_pipeline_wait() immediately instead of waiting out its ~1s
  * poll. radio_pipeline_wait() drains BOTH this queue and avrcp_uart's every
  * iteration, so either input works at any time, independently.
+ *
+ * The CAL_* values below are NOT drained by radio_pipeline_wait() at all
+ * (CAL_ENTER is the one exception - see radio_pipeline.h) - beep/heard/
+ * accept/cancel only mean anything once latency_cal_run() is already
+ * driving its own dedicated loop (main.c), which is the only thing that
+ * ever takes them off this queue. Their command handlers below check
+ * latency_cal_is_active() first and refuse (printing why) rather than
+ * enqueueing anything if a calibration session is not actually in progress -
+ * otherwise a stray 'beep' typed outside calibration would sit in this
+ * queue and could be misread by radio_pipeline_wait()'s next/prev handling.
  */
 typedef enum {
     CONSOLE_CMD_NONE = 0,
     CONSOLE_CMD_NEXT,
     CONSOLE_CMD_PREV,
+    CONSOLE_CMD_CAL_ENTER,
+    CONSOLE_CMD_CAL_BEEP,
+    CONSOLE_CMD_CAL_HEARD,
+    CONSOLE_CMD_CAL_ACCEPT,
+    CONSOLE_CMD_CAL_CANCEL,
 } console_cmd_t;
 
 /* Starts the console REPL, registers the commands above, creates the

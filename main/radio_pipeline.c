@@ -634,13 +634,16 @@ static void service_playlist_prefetch(void)
     }
 }
 
-esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd)
+esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd, bool *out_calibrate)
 {
     if (!event_iface) {
         return ESP_ERR_INVALID_STATE;
     }
     if (out_station_cmd) {
         *out_station_cmd = AVRCP_CMD_NONE;
+    }
+    if (out_calibrate) {
+        *out_calibrate = false;
     }
 
     bool has_deadline = (max_session_ticks != portMAX_DELAY);
@@ -670,14 +673,40 @@ esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_sta
             return ESP_OK;   /* healthy session, deliberately ended - no error backoff */
         }
 
-        /* Second, independent source of the same next/previous request -
-         * see console_cli.h. Mapped onto the avrcp_cmd_t the caller already
-         * understands rather than growing out_station_cmd's type: to every
-         * consumer downstream of this function, "switch station" means
-         * exactly the same thing regardless of which UI asked for it. */
+        /* Second, independent source of the same next/previous request, PLUS
+         * the console's `cal` (latency calibration) request - see
+         * console_cli.h. next/prev is mapped onto the avrcp_cmd_t the caller
+         * already understands rather than growing out_station_cmd's type: to
+         * every consumer downstream of this function, "switch station" means
+         * exactly the same thing regardless of which UI asked for it. `cal`
+         * is NOT a station change - it is reported through the separate
+         * out_calibrate flag instead, mutually exclusive with
+         * out_station_cmd (see radio_pipeline.h's doc comment). Any other
+         * console_cmd_t value (the CAL_BEEP/HEARD/ACCEPT/CANCEL family) is
+         * never actually enqueued here in the first place - console_cli.c's
+         * handlers for those refuse outside an active calibration session,
+         * which is the only thing that ever drains them - but ignoring
+         * anything unrecognized rather than assuming NEXT/PREV/CAL_ENTER is
+         * exhaustive costs nothing and fails safe if that enum ever grows. */
         console_cmd_t console_pending = console_cli_take_command(0);
-        if (console_pending != CONSOLE_CMD_NONE) {
-            avrcp_cmd_t mapped = (console_pending == CONSOLE_CMD_NEXT) ? AVRCP_CMD_NEXT : AVRCP_CMD_PREV;
+        avrcp_cmd_t mapped = AVRCP_CMD_NONE;
+        bool console_wants_calibrate = false;
+        switch (console_pending) {
+        case CONSOLE_CMD_NEXT:      mapped = AVRCP_CMD_NEXT; break;
+        case CONSOLE_CMD_PREV:      mapped = AVRCP_CMD_PREV; break;
+        case CONSOLE_CMD_CAL_ENTER: console_wants_calibrate = true; break;
+        default:                    break; /* CONSOLE_CMD_NONE, or a stray CAL_BEEP/HEARD/ACCEPT/CANCEL - ignore */
+        }
+
+        if (console_wants_calibrate) {
+            ESP_LOGI(TAG, "Console latency-calibration request received; ending this session");
+            if (out_calibrate) {
+                *out_calibrate = true;
+            }
+            return ESP_OK;   /* healthy session, deliberately ended - no error backoff */
+        }
+
+        if (mapped != AVRCP_CMD_NONE) {
             ESP_LOGI(TAG, "Console station-change command received; ending this session for a station switch");
             if (out_station_cmd) {
                 *out_station_cmd = mapped;

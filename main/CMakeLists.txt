@@ -10,6 +10,7 @@ idf_component_register(
         "avrcp_uart.c"
         "led_viz.c"
         "console_cli.c"
+        "latency_cal.c"
     INCLUDE_DIRS "."
     REQUIRES
         app_update
