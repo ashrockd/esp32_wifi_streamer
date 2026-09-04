@@ -9,6 +9,8 @@
 #include "esp_console.h"
 #include "esp_log.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
+#include "linenoise/linenoise.h"
 
 #include "audio_common.h"
 
@@ -27,6 +29,10 @@ static bool s_started;
 static QueueHandle_t s_cmd_queue;
 static audio_event_iface_handle_t s_evt;
 static esp_console_repl_t *s_repl;
+/* Single-slot handoff for CONSOLE_CMD_CAL_SET_MS - see console_cli.h's doc
+ * comment on console_cli_take_pending_cal_ms() for why a plain static is
+ * safe here (no queue needed for just this one value). */
+static volatile int32_t s_pending_cal_ms;
 
 /* Queues the command, then rings the doorbell - identical pattern to (and
  * fully independent of) avrcp_uart.c's dispatch_command(); see
@@ -251,7 +257,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t heard_cmd = {
         .command = "heard",
-        .help = "(during 'cal' only) register the instant you heard the test tone",
+        .help = "(during 'cal' only) register the instant you heard the test tone - "
+                "pressing Enter with nothing typed does the same thing and is faster",
         .hint = NULL,
         .func = &cmd_cal_heard,
     };
@@ -282,6 +289,114 @@ static void register_commands(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&status_cmd));
 }
 
+/* Kept in lockstep with the repl_config.prompt/max_cmdline_length values
+ * console_cli_start() below builds - both console_repl_task() and
+ * console_cli_start() need the same values, and it is simpler/less error-
+ * prone to define them once here than to thread them through as arguments
+ * or reach into ESP-IDF's private repl_com struct. */
+#define CONSOLE_PROMPT              "radio> "
+#define CONSOLE_MAX_CMDLINE_LEN     256
+
+/*
+ * This project's own REPL loop, in place of ESP-IDF's stock
+ * esp_console_repl_task() (esp_console_common.c) - started as a plain
+ * FreeRTOS task instead of via esp_console_start_repl(), which only exists
+ * to release that stock task. esp_console_new_repl_uart() below still does
+ * all the real setup (UART driver + VFS wiring, command registry, history)
+ * this loop depends on; its own private task is left permanently parked,
+ * blocked forever on the notification only esp_console_start_repl() would
+ * send - a small one-time idle-task cost, traded for not having to
+ * duplicate ESP-IDF's UART/VFS console setup a second time just to reach
+ * this one behavioural difference.
+ *
+ * That difference: a bare Enter press (an empty line - nothing typed) is
+ * treated as the calibration 'heard' response whenever latency_cal is
+ * actively waiting for one. ESP-IDF's own esp_console_run() silently
+ * swallows an empty line (ESP_ERR_INVALID_ARG, "command was empty" - there
+ * is no command name to look up) before any handler ever sees it, which is
+ * exactly right for a stray Enter everywhere else, but wrong for this one
+ * case: requiring a human to type a whole word ("heard") and hit Enter
+ * before the button-press is registered measures typing speed as much as
+ * reaction time - it is not possible to type and send an entire word
+ * within milliseconds of actually hearing something. Typing 'heard' out in
+ * full (cmd_cal_heard() above) still works identically; this just makes it
+ * optional rather than the only way in.
+ */
+static void console_repl_task(void *arg)
+{
+    (void)arg;
+
+    printf("\r\n"
+           "Type 'help' to get the list of commands.\r\n"
+           "Use UP/DOWN arrows to navigate through command history.\r\n"
+           "Press TAB when typing command name to auto-complete.\r\n");
+    if (linenoiseIsDumbMode()) {
+        printf("\r\n"
+               "Your terminal application does not support escape sequences.\n\n"
+               "Line editing and history features are disabled.\n\n"
+               "On Windows, try using Windows Terminal or Putty instead.\r\n");
+    }
+    linenoiseSetMaxLineLen(CONSOLE_MAX_CMDLINE_LEN);
+
+    while (true) {
+        char *line = linenoise(CONSOLE_PROMPT);
+        if (line == NULL) {
+            /* Matches ESP-IDF's own stock task: avoid spinning if the input
+             * backend is briefly unavailable. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (line[0] == '\0') {
+            /* Bare Enter - see this function's own doc comment above. */
+            if (latency_cal_is_awaiting_heard()) {
+                dispatch_command(CONSOLE_CMD_CAL_HEARD);
+            }
+            linenoiseFree(line);
+            continue;
+        }
+
+        /* A bare number typed during calibration - record it as a manually-
+         * entered trial instead of routing it through esp_console_run(),
+         * which would just fail with "Unrecognized command" (no command is
+         * literally named e.g. "220"). Deliberately requires the WHOLE line
+         * to be digits (strtol + checking *end) so this can never misfire
+         * on a real command that merely starts with a digit - there are
+         * none registered, but this stays correct if that ever changes. See
+         * latency_cal.c's CONSOLE_CMD_CAL_SET_MS case for what happens to
+         * this value - entering it during calibration specifically (not as
+         * a general console command) makes it participate in the same
+         * beep/heard trial averaging instead of just overwriting the saved
+         * value outright (that's what the existing separate 'latency <ms>'
+         * command already does, any time, cal or not). */
+        if (latency_cal_is_active()) {
+            char *end = NULL;
+            long ms = strtol(line, &end, 10);
+            if (end != line && *end == '\0') {
+                s_pending_cal_ms = (int32_t)ms;
+                dispatch_command(CONSOLE_CMD_CAL_SET_MS);
+                linenoiseFree(line);
+                continue;
+            }
+        }
+
+        linenoiseHistoryAdd(line);
+
+        int ret;
+        esp_err_t err = esp_console_run(line, &ret);
+        if (err == ESP_ERR_NOT_FOUND) {
+            printf("Unrecognized command\n");
+        } else if (err == ESP_ERR_INVALID_ARG) {
+            // command was empty - unreachable here, handled above
+        } else if (err == ESP_OK && ret != ESP_OK) {
+            printf("Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
+        } else if (err != ESP_OK) {
+            printf("Internal error: %s\n", esp_err_to_name(err));
+        }
+        linenoiseFree(line);
+    }
+}
+
 esp_err_t console_cli_start(void)
 {
     s_cmd_queue = xQueueCreate(CONSOLE_CMD_QUEUE_LEN, sizeof(uint8_t));
@@ -304,7 +419,8 @@ esp_err_t console_cli_start(void)
     }
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    repl_config.prompt = "radio> ";
+    repl_config.prompt = CONSOLE_PROMPT;
+    repl_config.max_cmdline_length = CONSOLE_MAX_CMDLINE_LEN;
 
     /* UART, matching CONFIG_ESP_CONSOLE_UART_NUM/_DEFAULT - see this file's
      * header comment for why (this board's actual laptop link is UART0 via
@@ -325,15 +441,19 @@ esp_err_t console_cli_start(void)
 
     register_commands();
 
-    err = esp_console_start_repl(s_repl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_console_start_repl failed: %s", esp_err_to_name(err));
+    /* Deliberately NOT esp_console_start_repl(s_repl) - see
+     * console_repl_task()'s doc comment above for why this project runs its
+     * own REPL loop instead of ESP-IDF's stock one. */
+    if (xTaskCreatePinnedToCore(console_repl_task, "console_io", repl_config.task_stack_size,
+                                NULL, repl_config.task_priority, NULL,
+                                repl_config.task_core_id) != pdPASS) {
+        ESP_LOGE(TAG, "Could not create console REPL task");
         audio_event_iface_destroy(s_evt);
         s_evt = NULL;
         vQueueDelete(s_cmd_queue);
         s_cmd_queue = NULL;
         s_repl = NULL;
-        return err;
+        return ESP_ERR_NO_MEM;
     }
 
     s_started = true;
@@ -358,4 +478,9 @@ console_cmd_t console_cli_take_command(TickType_t wait)
         return CONSOLE_CMD_NONE;
     }
     return (console_cmd_t)item;
+}
+
+int32_t console_cli_take_pending_cal_ms(void)
+{
+    return s_pending_cal_ms;
 }

@@ -350,8 +350,40 @@ static void radio_task(void *pvParameters)
         }
 
         consecutive_failures++;
+
+        /* Auto-advance through the station list on a real failure, not just
+         * the same one again - see RADIO_STATION_FAILOVER_DELAY_MS's comment
+         * in app_config.h. A bad/expired TuneIn entry or a dead stream URL
+         * should not stall playback behind minutes of backoff on that one
+         * station when the other RADIO_STATION_COUNT-1 stations are one hop
+         * away and probably fine. Only once every station has had a turn in
+         * this same failure streak without one working does this fall back
+         * to the pre-existing same-station exponential backoff below - at
+         * that point the problem is almost certainly broader than any one
+         * station (Wi-Fi, TuneIn itself, DNS), and cycling stations faster
+         * just means hammering a broken network harder, not finding a
+         * working one sooner. */
+        if (consecutive_failures <= (int)RADIO_STATION_COUNT) {
+            current_station_idx = station_list_next(current_station_idx);
+            ESP_LOGW(
+                TAG,
+                "Playback session ended/failed: %s; trying next station '%s' in %u ms "
+                "(failure %d of %u before falling back to same-station backoff)",
+                esp_err_to_name(err), RADIO_STATIONS[current_station_idx].name,
+                (unsigned)RADIO_STATION_FAILOVER_DELAY_MS, consecutive_failures,
+                (unsigned)RADIO_STATION_COUNT
+            );
+            vTaskDelay(pdMS_TO_TICKS(RADIO_STATION_FAILOVER_DELAY_MS));
+            continue;
+        }
+
+        /* consecutive_failures has already counted RADIO_STATION_COUNT
+         * failover hops by this point - offset it so the backoff below still
+         * starts at RADIO_RETRY_BASE_MS on the first same-station retry
+         * instead of an already-huge exponent inherited from the hops. */
+        int backoff_attempt = consecutive_failures - (int)RADIO_STATION_COUNT;
         uint32_t backoff_ms = RADIO_RETRY_BASE_MS;
-        for (int i = 1; i < consecutive_failures && backoff_ms < RADIO_RETRY_MAX_MS; i++) {
+        for (int i = 1; i < backoff_attempt && backoff_ms < RADIO_RETRY_MAX_MS; i++) {
             backoff_ms *= 2;
         }
         if (backoff_ms > RADIO_RETRY_MAX_MS) {
@@ -360,8 +392,10 @@ static void radio_task(void *pvParameters)
 
         ESP_LOGE(
             TAG,
-            "Playback session ended/failed: %s; retrying in %u ms (attempt %d)",
-            esp_err_to_name(err), (unsigned)backoff_ms, consecutive_failures
+            "Every station failed (%d consecutive failures) - likely a broader problem "
+            "(Wi-Fi/TuneIn/DNS), not one bad station; retrying '%s' in %u ms (attempt %d)",
+            consecutive_failures, RADIO_STATIONS[current_station_idx].name,
+            (unsigned)backoff_ms, backoff_attempt
         );
 
         vTaskDelay(pdMS_TO_TICKS(backoff_ms));

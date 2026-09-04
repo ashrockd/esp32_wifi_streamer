@@ -234,6 +234,24 @@
 #define RADIO_RETRY_BASE_MS         2000              /* first retry delay after a failure */
 #define RADIO_RETRY_MAX_MS          (5 * 60 * 1000)   /* retry backoff cap */
 
+/*
+ * 2026-09-04: a real failure (station API/stream error, not a user next/prev)
+ * now auto-advances through RADIO_STATION_COUNT stations - one bad station
+ * (an expired/broken TuneIn entry, a dead stream URL) should not stall
+ * playback behind minutes of exponential backoff on that one station when
+ * four other perfectly good ones are one hop away. This is the pause
+ * between each of those automatic hops - short, since a different endpoint
+ * is being tried each time (not hammering the same failing one), but not
+ * zero, so a whole round through every station does not turn into a tight
+ * loop against TuneIn's API. Once every station has had a turn in one
+ * failure streak without one working, main.c falls back to the pre-existing
+ * RADIO_RETRY_BASE_MS/_MAX_MS exponential backoff instead of continuing to
+ * cycle - at that point the problem is almost certainly broader than any
+ * single station (Wi-Fi, TuneIn itself, DNS), and cycling faster only means
+ * hammering a broken network harder, not finding a working station sooner.
+ */
+#define RADIO_STATION_FAILOVER_DELAY_MS  1000
+
 /* RESOURCE HEADROOM LOGGING (2026-08-22): verbose free-RAM/free-flash
  * reporting, added purely to gather real numbers before deciding whether
  * this chip has room for any further feature additions - see main.c's

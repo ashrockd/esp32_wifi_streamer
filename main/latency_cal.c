@@ -54,6 +54,7 @@ static audio_element_handle_t s_i2s_el;
 static int16_t *s_beep_buf;
 static size_t s_beep_bytes;
 static volatile bool s_active;
+static volatile bool s_waiting_for_heard;
 
 /*
  * Identical in spirit to radio_pipeline.c's own led_viz_write_cb() (static
@@ -240,9 +241,47 @@ static esp_err_t play_beep_blocking(void)
     return ESP_OK;
 }
 
+/*
+ * Records one trial value into `trials`/`*trial_count` and prints the same
+ * "Trial N: ...ms (average so far: ...)" summary regardless of where the
+ * value came from - a real beep/heard round-trip or a directly-typed
+ * number (CONSOLE_CMD_CAL_SET_MS) average in exactly the same way, mixed
+ * freely in one session. `label` distinguishes the two in the printed line
+ * ("" for a measured trial, " (entered directly)" for a typed one).
+ * Returns false (and prints why, prints nothing else) if `*trial_count` is
+ * already at CAL_MAX_TRIALS - caller should not have already touched
+ * trials[] in that case.
+ */
+static bool record_trial(int32_t *trials, int *trial_count, int32_t ms, const char *label)
+{
+    if (*trial_count >= CAL_MAX_TRIALS) {
+        printf("Already have %d trials (the most this tracks) - 'accept' or 'cancel' now.\n",
+               CAL_MAX_TRIALS);
+        return false;
+    }
+    trials[*trial_count] = ms;
+    (*trial_count)++;
+
+    int32_t sum = 0, tmin = trials[0], tmax = trials[0];
+    for (int i = 0; i < *trial_count; i++) {
+        sum += trials[i];
+        if (trials[i] < tmin) tmin = trials[i];
+        if (trials[i] > tmax) tmax = trials[i];
+    }
+    printf("Trial %d: %" PRId32 "ms%s  (average so far: %" PRId32 "ms over %d trial(s), "
+           "min=%" PRId32 " max=%" PRId32 ")\n",
+           *trial_count, ms, label, sum / *trial_count, *trial_count, tmin, tmax);
+    return true;
+}
+
 bool latency_cal_is_active(void)
 {
     return s_active;
+}
+
+bool latency_cal_is_awaiting_heard(void)
+{
+    return s_waiting_for_heard;
 }
 
 void latency_cal_run(void)
@@ -286,19 +325,25 @@ void latency_cal_run(void)
     }
 
     printf("Ready. Commands from here:\n");
-    printf("  beep    - play a %dms test tone right now\n", CAL_BEEP_DURATION_MS);
-    printf("  heard   - type this the INSTANT you actually hear it from the speaker\n");
-    printf("  accept  - save the average of all trials so far and resume playback\n");
-    printf("  cancel  - discard everything and resume playback unchanged\n");
-    printf("Do a few 'beep'/'heard' pairs (3-5 is plenty) before 'accept' for a stable average.\n");
-    printf("Note: this measures tone-to-button-press, which includes your own reaction time\n");
+    printf("  beep       - play a %dms test tone right now\n", CAL_BEEP_DURATION_MS);
+    printf("  <Enter>    - press Enter with NOTHING typed the INSTANT you hear the tone\n");
+    printf("               ('heard' still works too if you type it out, but plain Enter is\n");
+    printf("               faster and more accurate - typing a whole word first adds real,\n");
+    printf("               variable delay on top of what this is trying to measure)\n");
+    printf("  <number>   - type a number (ms) and hit Enter to record THAT as a trial directly,\n");
+    printf("               skipping beep/Enter entirely - e.g. if you already know a good value.\n");
+    printf("               Mixes freely with real beep/<Enter> trials in the same average.\n");
+    printf("  accept     - save the average of all trials so far and resume playback\n");
+    printf("  cancel     - discard everything and resume playback unchanged\n");
+    printf("Do a few 'beep'/<Enter> pairs (3-5 is plenty) before 'accept' for a stable average.\n");
+    printf("Note: this measures tone-to-keypress, which includes your own reaction time\n");
     printf("(commonly ~150-250ms) alongside the real hardware delay - that is expected, not\n");
     printf("an error, since the goal is syncing the LED to what a human perceives, not a lab figure.\n");
     printf("Current latency compensation: %" PRId32 "ms\n\n", led_viz_get_latency_ms());
 
     int32_t trials[CAL_MAX_TRIALS];
     int trial_count = 0;
-    bool waiting_for_heard = false;
+    s_waiting_for_heard = false;
     int64_t t0_us = 0;
     bool done = false;
 
@@ -306,8 +351,8 @@ void latency_cal_run(void)
         console_cmd_t cmd = console_cli_take_command(CAL_POLL_TICKS);
         switch (cmd) {
         case CONSOLE_CMD_CAL_BEEP:
-            if (waiting_for_heard) {
-                printf("Already waiting for 'heard' on the current trial - type that first.\n");
+            if (s_waiting_for_heard) {
+                printf("Already waiting on the current trial - hit Enter (or type 'heard') first.\n");
                 break;
             }
             t0_us = esp_timer_get_time();
@@ -315,16 +360,16 @@ void latency_cal_run(void)
                 printf("Could not play the test tone - try 'beep' again.\n");
                 break;
             }
-            waiting_for_heard = true;
-            printf("Beep sent - type 'heard' the instant you hear it.\n");
+            s_waiting_for_heard = true;
+            printf("Beep sent - hit Enter (nothing else) the instant you hear it.\n");
             break;
 
         case CONSOLE_CMD_CAL_HEARD: {
-            if (!waiting_for_heard) {
+            if (!s_waiting_for_heard) {
                 printf("No trial in progress - type 'beep' first.\n");
                 break;
             }
-            waiting_for_heard = false;
+            s_waiting_for_heard = false;
             int64_t t1_us = esp_timer_get_time();
             int32_t delay_ms = (int32_t)((t1_us - t0_us) / 1000);
 
@@ -336,22 +381,32 @@ void latency_cal_run(void)
                        "redoing this trial.\n", delay_ms);
             }
 
-            if (trial_count >= CAL_MAX_TRIALS) {
-                printf("Already have %d trials (the most this tracks) - 'accept' or 'cancel' now.\n",
-                       CAL_MAX_TRIALS);
+            record_trial(trials, &trial_count, delay_ms, "");
+            break;
+        }
+
+        case CONSOLE_CMD_CAL_SET_MS: {
+            /* A bare number typed at the prompt instead of a beep/heard
+             * round-trip - see console_cli.c's console_repl_task() for how
+             * this got here. Averages in with real trials exactly like any
+             * other - e.g. type '220' a few times, or mix with real
+             * beep/heard pairs, then 'accept' either way. This is NOT the
+             * same as the always-available 'latency <ms>' console command
+             * (console_cli.c's cmd_latency()), which sets and persists the
+             * value immediately and unconditionally, cal session or not -
+             * this one only ever contributes to the average this session
+             * is building, exactly as if it had been measured. */
+            int32_t ms = console_cli_take_pending_cal_ms();
+            if (s_waiting_for_heard) {
+                printf("A beep is still waiting for a response - hit Enter (or type 'heard') "
+                       "to finish that trial first.\n");
                 break;
             }
-            trials[trial_count++] = delay_ms;
-
-            int32_t sum = 0, tmin = trials[0], tmax = trials[0];
-            for (int i = 0; i < trial_count; i++) {
-                sum += trials[i];
-                if (trials[i] < tmin) tmin = trials[i];
-                if (trials[i] > tmax) tmax = trials[i];
+            if (ms < 0 || ms > 60000) {
+                printf("Ignored: %" PRId32 "ms is outside a sane range (0-60000).\n", ms);
+                break;
             }
-            printf("Trial %d: %" PRId32 "ms  (average so far: %" PRId32 "ms over %d trial(s), "
-                   "min=%" PRId32 " max=%" PRId32 ")\n",
-                   trial_count, delay_ms, sum / trial_count, trial_count, tmin, tmax);
+            record_trial(trials, &trial_count, ms, " (entered directly)");
             break;
         }
 
@@ -396,6 +451,11 @@ void latency_cal_run(void)
     teardown_pipeline();
     free_beep();
     led_viz_reset_history();
+    /* Defensive: only 'accept'/'cancel' can reach here and neither goes
+     * through this while still mid-trial, but leaving this set would make a
+     * stray Enter right after calibration ends misread as a 'heard' - see
+     * console_cli.c's REPL loop. */
+    s_waiting_for_heard = false;
     s_active = false;
     printf("Resuming normal playback...\n\n");
 }

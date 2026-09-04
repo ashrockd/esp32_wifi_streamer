@@ -67,3 +67,19 @@ void latency_cal_run(void);
  * meaningful way to interpret them). Safe to call from any task.
  */
 bool latency_cal_is_active(void);
+
+/*
+ * True only during the window between a 'beep' trial firing and its
+ * response being registered - i.e. exactly when a 'heard' response is
+ * expected. console_cli.c's REPL loop checks this to decide whether a bare
+ * Enter press (no text typed at all) should be treated as that response -
+ * see its own comment for why that matters: making a human type a whole
+ * word ("heard") before hitting Enter bakes real, variable typing time into
+ * a measurement that is supposed to capture reaction time, not typing
+ * speed - it is not possible to type and send a whole word within the same
+ * millisecond you register hearing something. Typing 'heard' out in full
+ * still works too (console_cli.c keeps that command registered as an
+ * alias); this just stops it being the only option. Only meaningful while
+ * latency_cal_is_active() is also true. Safe to call from any task.
+ */
+bool latency_cal_is_awaiting_heard(void);

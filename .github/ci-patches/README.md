@@ -140,6 +140,45 @@ checked out at that exact commit.
      for that string), which is this project's established convention for
      marking exactly this kind of edit.
 
+   **2026-09-04: regenerated to also include `MAX_PLAYLIST_LINE_SIZE`'s
+   512 -> 2048 widening** (unrelated to connection reuse/prefetch, but the
+   same file - see patch #6 below for why). Kept as one file rather than
+   splitting `http_stream.c` across two patches, to avoid two patches both
+   claiming ownership of the same file's diff against the same base.
+
+6. **`esp-adf/0006-line_reader-null-terminate-overflow-and-widen-buffers.patch`**
+   `components/audio_stream/lib/hls/line_reader.c` /
+   `components/audio_stream/lib/hls/include/line_reader.h` /
+   `components/audio_stream/lib/hls/hls_parse.h` - fixes a real heap-
+   corruption bug found on hardware, plus widens two related buffers.
+   `line_reader_add_char()` dropped EVERY write once a line hit its
+   `line_size` cap - including the caller's own NUL-terminator write, which
+   is indistinguishable from any other write to that function - so an
+   overlong line came back from `line_reader_get_line()` unterminated
+   inside its own heap allocation. Every caller (`http_stream.c`'s playlist
+   parsing, `hls_parse.c`'s HLS demuxer) treats that return value as a
+   plain C string, so `strlen()`/URL-building code kept reading past the
+   end of the buffer until it happened to hit a zero byte in whatever
+   memory followed, splicing adjacent heap contents onto whatever was being
+   built. **Confirmed on real hardware**: a fetched HLS segment URL (from
+   `http_stream.c`'s live-playlist re-fetch) came back with several bytes
+   of unrelated binary garbage appended after a real query string, which
+   then failed `esp_http_client`'s URL parser outright - traced directly to
+   this function via the matching `"LINE_READER: Line too long..."` log
+   line appearing immediately before the corrupted URL in the same
+   hardware log. Fixed by reserving the buffer's last byte exclusively for
+   the terminator (real characters now stop one slot short of `line_size`,
+   and the terminator write is honored unconditionally into that reserved
+   slot) - an overlong line now comes back safely truncated instead of
+   unterminated. Also widens `MAX_PLAYLIST_LINE_SIZE`
+   (`http_stream.c`, folded into patch #5 above since it is the same file)
+   and `HLS_MAX_LINE_CHAR` (`hls_parse.h`) from 512 to 2048 bytes, so this
+   truncation path is not hit at all for realistic playlist lines (some
+   stations' signed accessKey query strings alone run past 512 bytes) -
+   cheap on this board's 8MB PSRAM. **Without this patch, any station whose
+   playlist has a line over 512 bytes can corrupt the heap and crash the
+   board** - not cosmetic, a real correctness/stability fix.
+
 ## Patches applied (esp-adf-libs submodule)
 
 6. **`esp-adf-libs/0001-cmakelists-expose-esp_audio_codec.patch`**
@@ -246,8 +285,9 @@ true single-file, independently-meaningful edit and gets its own patch file.
 1. Check out `esp-adf` at `eac70fd2`, init only the `components/esp-adf-libs`
    submodule (at `3472016`) - **not** the `esp-idf` submodule, per "Which
    ESP-IDF actually matters" above.
-2. Apply all 5 `esp-adf/*.patch` files (`git apply`, run from the `esp-adf`
-   checkout root).
+2. Apply all 6 `esp-adf/*.patch` files (`git apply`, run from the `esp-adf`
+   checkout root) - `docker-build.sh` globs the directory alphabetically, so
+   a new patch just needs the right filename prefix, no script change.
 3. Apply `esp-adf-libs/0001-*.patch` (run from `esp-adf/components/
    esp-adf-libs`).
 4. Apply `esp-idf/0001-*.patch` to the Docker image's baked-in `/opt/esp/idf`

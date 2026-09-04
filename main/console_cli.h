@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 
@@ -45,10 +47,13 @@
  *                         next/prev) and hands the console over to a guided
  *                         beep/heard measurement flow instead of resuming
  *                         normal playback. Once inside that flow:
- *                           beep    - play a test tone now
- *                           heard   - type this the instant you hear it
- *                           accept  - save the measured average, resume playback
- *                           cancel  - discard, resume playback unchanged
+ *                           beep     - play a test tone now
+ *                           <Enter>  - (nothing typed) register hearing the tone -
+ *                                      'heard' still works too, just slower
+ *                           <number> - record that many ms as a trial directly,
+ *                                      no beep needed - mixes with real trials
+ *                           accept   - save the measured average, resume playback
+ *                           cancel   - discard, resume playback unchanged
  *   status             - prints the currently playing station, the LED
  *                         threshold, and the latency compensation.
  *
@@ -79,6 +84,12 @@ typedef enum {
     CONSOLE_CMD_CAL_HEARD,
     CONSOLE_CMD_CAL_ACCEPT,
     CONSOLE_CMD_CAL_CANCEL,
+    /* (during 'cal' only) a bare number typed at the prompt instead of a
+     * beep/heard round-trip - see console_cli_take_pending_cal_ms() and
+     * console_repl_task()'s own comment (console_cli.c) for how this gets
+     * here, and latency_cal_run()'s own CONSOLE_CMD_CAL_SET_MS case
+     * (latency_cal.c) for what consumes it. */
+    CONSOLE_CMD_CAL_SET_MS,
 } console_cmd_t;
 
 /* Starts the console REPL, registers the commands above, creates the
@@ -102,3 +113,14 @@ audio_event_iface_handle_t console_cli_get_event_iface(void);
  * there). Returns CONSOLE_CMD_NONE if console_cli_start() was never called
  * or failed. */
 console_cmd_t console_cli_take_command(TickType_t wait);
+
+/*
+ * The value that accompanies a CONSOLE_CMD_CAL_SET_MS command - a single-
+ * slot handoff, not a queue: console_repl_task() (console_cli.c) sets it
+ * immediately before enqueueing that command, and never writes another
+ * value before that command is dequeued and consumed, because it blocks on
+ * the next linenoise() read in between - there is no code path that could
+ * type a second number before the first is consumed. Call this exactly
+ * once, right after taking a CONSOLE_CMD_CAL_SET_MS off the queue (see
+ * latency_cal.c). Meaningless for any other command. */
+int32_t console_cli_take_pending_cal_ms(void);

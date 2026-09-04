@@ -1,0 +1,107 @@
+diff --git a/components/audio_stream/lib/hls/hls_parse.h b/components/audio_stream/lib/hls/hls_parse.h
+index 7f6ec160..37af1ba9 100644
+--- a/components/audio_stream/lib/hls/hls_parse.h
++++ b/components/audio_stream/lib/hls/hls_parse.h
+@@ -37,7 +37,11 @@ extern "C" {
+ #include "line_reader.h"
+ 
+ #define HLS_MAX_ATTR_NUM             (16)
+-#define HLS_MAX_LINE_CHAR            (512)
++/* LOCAL PATCH (see esp32_wifi_streamer/.github/ci-patches/README.md):
++ * widened 512 -> 2048, same reasoning as http_stream.c's own
++ * MAX_PLAYLIST_LINE_SIZE (this file's line_reader_init() call parses the
++ * master/variant m3u8 playlists that same code path fetches). */
++#define HLS_MAX_LINE_CHAR            (2048)
+ 
+ #define HLS_STR_AES_128              "AES-128"
+ #define HLS_STR_AUDIO                "AUDIO"
+diff --git a/components/audio_stream/lib/hls/include/line_reader.h b/components/audio_stream/lib/hls/include/line_reader.h
+index 41020c68..11114d07 100644
+--- a/components/audio_stream/lib/hls/include/line_reader.h
++++ b/components/audio_stream/lib/hls/include/line_reader.h
+@@ -43,6 +43,13 @@ typedef struct {
+     uint8_t* line_buffer;      /*!< Cache buffers for input data */
+     uint16_t line_size;        /*!< Buffer size of cache buffer */
+     uint16_t line_fill;        /*!< Cached size */
++    /* LOCAL PATCH (see esp32_wifi_streamer/.github/ci-patches/README.md):
++     * true once the CURRENT line has hit line_size-1 stored characters -
++     * lets line_reader_add_char() log the overflow once per overlong line
++     * instead of once per excess character, and tells it the NUL-terminator
++     * write below is completing an already-truncated line rather than a
++     * normal one. Reset to false every time a line is returned/reset. */
++    bool     line_overflowed;
+ } line_reader_t;
+ 
+ /**
+diff --git a/components/audio_stream/lib/hls/line_reader.c b/components/audio_stream/lib/hls/line_reader.c
+index 5c1b3f32..fcddfc26 100644
+--- a/components/audio_stream/lib/hls/line_reader.c
++++ b/components/audio_stream/lib/hls/line_reader.c
+@@ -31,12 +31,48 @@
+ 
+ #define TAG "LINE_READER"
+ 
++/*
++ * LOCAL PATCH (see esp32_wifi_streamer/.github/ci-patches/README.md):
++ * upstream let this silently corrupt the heap on an overlong line. The
++ * original body wrote real characters while `line_fill < line_size`, and
++ * otherwise just logged and dropped the byte - including when the caller
++ * was line_reader_get_line()'s own NUL-terminator write (`line_reader_add_
++ * char(b, 0)`), since that call is indistinguishable from any other by this
++ * function. Once a line hit line_size characters, EVERY later write to
++ * this buffer - terminator included - was dropped, so the "line" returned
++ * to the caller was never NUL-terminated inside its own allocation. Every
++ * caller in this tree (http_stream.c, hls_parse.c) treats that return
++ * value as a plain C string - strlen()/strcpy()/URL-building all then read
++ * past the end of this heap block until they happened to hit a zero byte
++ * in whatever memory followed it, splicing adjacent heap contents onto
++ * whatever was being built (confirmed on real hardware: a fetched HLS
++ * segment URL with several bytes of unrelated binary garbage appended,
++ * which then failed to parse as a URL at all).
++ *
++ * Fixed by reserving the last slot (index line_size-1) exclusively for the
++ * terminator: real characters stop being stored one slot earlier than
++ * before, and the c==0 terminator call is honored UNCONDITIONALLY by
++ * writing straight into that reserved slot, regardless of whether the line
++ * overflowed. An overlong line now comes back safely truncated - still a
++ * valid, fully NUL-terminated C string - instead of unterminated. The
++ * `line_overflowed` flag (line_reader_t, line_reader.h) turns the original
++ * per-excess-character log spam (one line logged for every byte past the
++ * cap - the literal hardware symptom this patch was written from) into one
++ * log line per overlong source line.
++ */
+ static inline void line_reader_add_char(line_reader_t* b, uint8_t c)
+ {
+-    if (b->line_fill < b->line_size) {
++    if (b->line_fill < b->line_size - 1) {
+         b->line_buffer[b->line_fill++] = c;
+-    } else {
+-        ESP_LOGE(TAG, "Line too long try to init large than %d", b->line_size);
++        return;
++    }
++    if (c == 0) {
++        b->line_buffer[b->line_size - 1] = 0;
++        return;
++    }
++    if (!b->line_overflowed) {
++        b->line_overflowed = true;
++        ESP_LOGE(TAG, "Line too long (>%d bytes) - truncating", b->line_size - 1);
+     }
+ }
+ 
+@@ -76,6 +112,7 @@ char* line_reader_get_line(line_reader_t* b)
+             if (b->line_fill) {
+                 line_reader_add_char(b, 0);
+                 b->line_fill = 0;
++                b->line_overflowed = false;   /* LOCAL PATCH - see line_reader_add_char() */
+                 return (char*)b->line_buffer;
+             }
+             continue;
+@@ -87,6 +124,7 @@ char* line_reader_get_line(line_reader_t* b)
+     if (b->eos && b->line_fill) {
+         line_reader_add_char(b, 0);
+         b->line_fill = 0;
++        b->line_overflowed = false;   /* LOCAL PATCH - see line_reader_add_char() */
+         return (char*)b->line_buffer;
+     }
+     b->rp = 0; // auto reset
