@@ -124,6 +124,30 @@ static void resource_log_timer_cb(void *arg)
 {
     (void)arg;
     log_ram_usage("periodic");
+
+    /* 2026-09-04, TEMPORARY DIAGNOSTIC (see sdkconfig.defaults' matching
+     * comment on CONFIG_HEAP_POISONING_LIGHT) - two real hardware crashes
+     * were both heap-corruption-surfaces-downstream signatures (a wild
+     * pointer inside tlsf_free()'s coalescing, then a "block already marked
+     * as free" assert), caught only once the corrupted region happened to be
+     * touched again, tens of minutes and a full session away from wherever
+     * the actual bad write occurred. This walks the TLSF free-list structure
+     * itself on every periodic tick (~RADIO_RESOURCE_LOG_INTERVAL_MS) - independent
+     * of and complementary to the poisoning canaries, which only get checked
+     * when a SPECIFIC block is freed - so a structural problem is caught
+     * within one tick of first existing, not just when something eventually
+     * stumbles into it. print_errors=true dumps the corrupt block's details
+     * directly to the log if this ever fails, which is the single most
+     * useful piece of evidence for narrowing down which allocation is
+     * actually at fault. Remove alongside the sdkconfig.defaults poisoning
+     * setting once a fix is confirmed stable - a full heap walk every tick,
+     * on every heap in the system, is not free, even if it is cheap next to
+     * COMPREHENSIVE poisoning's per-operation cost. */
+    if (!heap_caps_check_integrity_all(true)) {
+        ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED by the periodic integrity check above - "
+                 "see the heap_caps_check_integrity_all() output just printed for exactly "
+                 "which allocation/region is affected");
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)

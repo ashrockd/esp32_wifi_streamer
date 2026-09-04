@@ -144,3 +144,36 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
 
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
+
+# 2026-09-04, TEMPORARY DIAGNOSTIC - two real hardware heap-corruption
+# crashes (see [[esp32-wifi-streamer-aac-heap-crash]] project memory / the
+# aac_dec_element.c comment on AAC_DEC_PCM_BYTES), both caught downstream of
+# where the actual corruption happened: a StoreProhibited fault inside
+# tlsf_free()'s block-coalescing on a 20-minute proactive session refresh,
+# and (after the first fix shifted heap layout enough to change WHICH
+# allocation the same underlying issue lands on) a "block already marked as
+# free" assert on a station change. Both are the standard signature of heap
+# metadata corruption surfacing far from its actual write - see ESP-IDF's own
+# heap-debugging guidance: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/heap_debug.html
+#
+# LIGHT (not COMPREHENSIVE): adds head/tail canary bytes to every allocation,
+# checked whenever that block is next freed - this reliably catches a buffer
+# OVERRUN (writing past the end of an allocation), which is the leading
+# hypothesis for both crashes above, at much lower cost than COMPREHENSIVE
+# (which additionally re-validates the ENTIRE heap's structure on every
+# single malloc/free anywhere in the system - real overhead for a real-time
+# audio decode path, not justified until LIGHT proves insufficient).
+#
+# Combined with main.c's periodic heap_caps_check_integrity_all() call (see
+# resource_log_timer_cb) - that call already runs every
+# RADIO_RESOURCE_LOG_INTERVAL_MS regardless of this setting, and will now
+# also benefit from poisoning's finer-grained per-block canaries when it
+# finds something wrong.
+#
+# TAKE THIS BACK OUT once a fix is confirmed hardware-stable (a long,
+# uninterrupted run - past 20 minutes - AND several station changes, with no
+# crash and no "CORRUPT HEAP"/canary-check log line) - it has a real, if
+# modest, per-allocation cost that has no reason to ship permanently once its
+# job here is done.
+CONFIG_HEAP_POISONING_DISABLED=n
+CONFIG_HEAP_POISONING_LIGHT=y
