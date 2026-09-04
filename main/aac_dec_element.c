@@ -138,6 +138,30 @@ static esp_err_t aac_dec_close(audio_element_handle_t self)
 {
     aac_dec_t *d = (aac_dec_t *)audio_element_getdata(self);
     if (d && d->opened) {
+        /* 2026-09-04, TEMPORARY DIAGNOSTIC - the decisive check. Four real
+         * hardware crashes so far all land inside esp_aac_dec_close() ->
+         * PVMP4AudioDecoderDeInit() -> free(), but NEITHER of this file's
+         * other two checks (right after open, and every ~50 decode calls)
+         * has ever fired first - meaning the heap was still clean at least
+         * up through the last periodic check, tens of calls before this
+         * point. This closes that remaining blind spot directly: checked
+         * HERE, before esp_aac_dec_close() runs at all, this either (a)
+         * fails, proving the heap is ALREADY corrupt the instant close() is
+         * entered - meaning something OTHER than esp_aac_dec_close() itself
+         * did the damage (a handful of decode calls this file's own
+         * per-50-call sampling missed, or something concurrent in the
+         * teardown sequence - e.g. fmp4_bridge's on_cmd_error path running
+         * on a different task at roughly the same moment, both triggered by
+         * the same audio_pipeline_stop() call) - or (b) passes, proving the
+         * corruption happens strictly INSIDE esp_aac_dec_close() itself, on
+         * every single call, which would make this a highly reproducible,
+         * fully closed-source-library-internal bug rather than a rare or
+         * external one. Either answer is decisive; remove alongside every
+         * other TEMPORARY DIAGNOSTIC in this project once a fix lands. */
+        if (!heap_caps_check_integrity_all(true)) {
+            ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED before esp_aac_dec_close() was even called - "
+                     "something ELSE corrupted it first, not esp_aac_dec_close() itself");
+        }
         esp_aac_dec_close(d->dec);
         d->dec = NULL;
         d->opened = false;
