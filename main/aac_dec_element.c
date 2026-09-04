@@ -15,12 +15,43 @@
 static const char *TAG = "AAC_DEC";
 
 /* One AAC-LC frame is exactly 1024 samples; stereo 16-bit => 4096 bytes.
- * Sized to that, not doubled: esp_aac_dec reports needed_size when a buffer
- * is short, which process() handles explicitly, so over-allocating here only
- * steals contiguous heap from mbedTLS (whose TLS record buffer needs ~15KB
- * in one block - "Dynamic Impl: alloc(15399 bytes) failed" was caused by
- * exactly that competition). */
-#define AAC_DEC_PCM_BYTES        4096
+ *
+ * 2026-09-04, DOUBLED (was exactly 4096, zero margin) after a hardware crash
+ * traced via addr2line against a real crash dump: a Guru Meditation
+ * StoreProhibited fault deep inside tlsf_free()'s block-coalescing logic,
+ * reached from aac_dec_close() -> esp_aac_dec_close() ->
+ * PVMP4AudioDecoderDeInit() -> codec_memory_free() - i.e. the crash SITE was
+ * this element's close() path (only exercised once every ~20 minutes, at
+ * RADIO_SESSION_MAX_MS), but heap corruption crashes happen where the
+ * corrupted memory is next TOUCHED, not where it was corrupted - the actual
+ * overwrite happened earlier, silently, during ordinary decoding.
+ *
+ * Leading hypothesis: `out.len` below is an upper bound the decoder is
+ * SUPPOSED to respect (and does, for the ESP_AUDIO_ERR_BUFF_NOT_ENOUGH path
+ * this file already handles) - but esp_aac_dec wraps PVMP4AudioDecoder, a
+ * decoder originally written to always support AAC's "implicit" SBR
+ * signalling (same sample rate advertised for the AAC-LC core and any SBR
+ * extension, detected from the bitstream itself rather than an explicit
+ * descriptor). If this stream ever contains a frame that trips that
+ * detection despite `aac_plus_enable = false` below - a real-world AAC
+ * decoder gotcha, not specific to this library - decoded_size could come
+ * back at up to 2x a plain AAC-LC frame (SBR doubles the sample count), which
+ * is exactly a single-frame overflow into whatever the heap allocator placed
+ * right after a buffer sized with NO margin at all. Doubling this buffer
+ * means that exact failure mode now has somewhere harmless to land instead
+ * of corrupting adjacent heap metadata. This is a defensive mitigation for a
+ * closed-source library's internal behaviour, not a confirmed root cause -
+ * see the bounds check added in the decode loop below, which would catch
+ * (and loudly log) decoded_size ever exceeding the OLD 4096 figure, turning
+ * this hypothesis into a confirmed one if it ever fires.
+ *
+ * Cost: this project has 8MB of PSRAM (audio_malloc() lands there
+ * automatically once PSRAM is enabled - see app_config.h's file header) and
+ * this is a single small per-element buffer, not a per-fragment/per-TLS
+ * allocation - the mbedTLS-contention history this comment used to cite
+ * (fighting for one contiguous ~15KB block on the pre-PSRAM WROOM-32U) does
+ * not apply on this hardware. */
+#define AAC_DEC_PCM_BYTES        8192
 
 /* Compressed input held per process() call. Real frames on this stream run
  * ~470-1060 bytes (measured from a captured segment), so this holds at least
@@ -219,6 +250,25 @@ static audio_element_err_t aac_dec_process(audio_element_handle_t self,
             }
             ESP_LOGW(TAG, "decode error %d, skipping %d bytes",
                      (int)err, (int)raw.consumed);
+        }
+
+        if (out.decoded_size > AAC_DEC_PCM_BYTES) {
+            /* Should be impossible - out.len above told the decoder its
+             * capacity, and ESP_AUDIO_ERR_BUFF_NOT_ENOUGH is the documented
+             * way to report "would not fit" instead of writing anyway. If
+             * this ever logs, it CONFIRMS the decoder wrote past the buffer
+             * it was told it had (see AAC_DEC_PCM_BYTES's 2026-09-04 comment)
+             * - the heap is likely already corrupted by the time this check
+             * runs, so this cannot undo the overwrite, only make it loud
+             * instead of a silent crash tens of minutes later somewhere
+             * unrelated. Failing this element is the closest thing to safe:
+             * it tears down (and, via radio_task's retry backoff, restarts)
+             * rather than continuing to hand a possibly-corrupted heap more
+             * work. */
+            ESP_LOGE(TAG, "esp_aac_dec_decode reported decoded_size=%u, more than the %d-byte "
+                     "output buffer it was given - the decoder wrote past its buffer",
+                     (unsigned)out.decoded_size, AAC_DEC_PCM_BYTES);
+            return AEL_IO_FAIL;
         }
 
         if (out.decoded_size > 0) {
