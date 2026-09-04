@@ -26,6 +26,7 @@
 #include "console_cli.h"
 #include "latency_cal.h"
 #include "led_viz.h"
+#include "nowplaying.h"
 #include "playlist_prefetch.h"
 #include "radio_pipeline.h"
 #include "station_list.h"
@@ -122,9 +123,82 @@ static void log_flash_usage(void)
     }
 }
 
+/* PLAYBACK STATUS LOGGING - piggybacks on the same periodic tick as the RAM
+ * report above (RADIO_RESOURCE_LOG_INTERVAL_MS) so a run's serial log has
+ * one place to find "what was playing and how healthy" lined up against
+ * "what RAM looked like" at the same moments, without needing timestamps
+ * cross-referenced by hand. Station and LED state are cheap, current-value
+ * reads (station_list.h/led_viz.h); the measured bit rate is the one field
+ * that has to be derived here rather than just read, since nothing on this
+ * pipeline's path carries real bitrate metadata (see radio_pipeline.h's
+ * radio_pipeline_get_stream_stats() comment) - it's computed from the delta
+ * in http_reader's own byte counter across two ticks of this exact timer.
+ * Track title/artist/album/artwork (nowplaying.h) is likewise a cheap,
+ * non-blocking read of whatever radio_pipeline.c's own background poller
+ * last found - see its own file comment for the whole mechanism. */
+static void log_playback_status(void)
+{
+    uint8_t idx = station_list_get_now_playing();
+    const char *station_name = (idx < RADIO_STATION_COUNT) ? RADIO_STATIONS[idx].name : "none yet";
+    const char *station_id   = (idx < RADIO_STATION_COUNT) ? RADIO_STATIONS[idx].id : "-";
+
+    radio_pipeline_stream_stats_t stats;
+    radio_pipeline_get_stream_stats(&stats);
+
+    ESP_LOGI(TAG, "STATUS: station='%s' (%s) [%u/%u] | stream=%s, %d Hz, %d ch",
+             station_name, station_id,
+             (unsigned)(idx < RADIO_STATION_COUNT ? idx + 1 : 0), (unsigned)RADIO_STATION_COUNT,
+             stats.format_name, stats.sample_rate_hz, stats.channels);
+    ESP_LOGI(TAG, "STATUS: LED latency comp=%" PRId32 "ms, peak threshold=%.1fdBFS",
+             led_viz_get_latency_ms(), led_viz_get_threshold_db());
+
+    /* Measured HTTP throughput, not a nominal per-station figure - see
+     * radio_pipeline.h's radio_pipeline_stream_stats_t comment for why
+     * that's the only bit-rate figure available on this pipeline's path at
+     * all. Static state persists across calls (this function only ever runs
+     * off resource_log_timer_cb's one periodic esp_timer), so each reading
+     * only has to diff against the previous one. A byte count that has gone
+     * DOWN since last time (a full pipeline rebuild handed out a fresh
+     * http_reader - see radio_pipeline.h) or an inactive pipeline invalidates
+     * the delta rather than producing a bogus negative/inflated rate; the
+     * very first reading has nothing to diff against yet either, so all
+     * three cases are treated the same way: skip this tick, just remember
+     * where things stand for the next one. */
+    static int64_t prev_bytes = -1;
+    static int64_t prev_time_us;
+    int64_t now_us = esp_timer_get_time();
+    if (stats.active && prev_bytes >= 0 && stats.http_bytes_total >= prev_bytes && now_us > prev_time_us) {
+        int64_t delta_bytes = stats.http_bytes_total - prev_bytes;
+        int64_t elapsed_us  = now_us - prev_time_us;
+        float kbps = ((float)delta_bytes * 8.0f) / ((float)elapsed_us / 1000000.0f) / 1000.0f;
+        ESP_LOGI(TAG, "STATUS: HTTP throughput=%.1f kbps (measured over last %" PRId64 "ms; "
+                 "actual network bytes incl. HLS/CMAF container overhead, not a nominal codec rate)",
+                 kbps, elapsed_us / 1000);
+    } else {
+        ESP_LOGI(TAG, "STATUS: HTTP throughput=n/a (no prior sample yet, or pipeline just (re)started)");
+    }
+    prev_bytes = stats.active ? stats.http_bytes_total : -1;
+    prev_time_us = now_us;
+
+    /* Currently playing track - see nowplaying.h. Non-blocking: this always
+     * returns immediately with whatever the last completed background poll
+     * produced, never the result of a fetch happening right now. */
+    nowplaying_info_t track;
+    nowplaying_get_current(&track);
+    if (track.valid) {
+        ESP_LOGI(TAG, "STATUS: now playing '%s' - '%s' (album '%s') [as of %" PRIu32 "ms ago]",
+                 track.title, track.subtitle, track.album, track.age_ms);
+        ESP_LOGI(TAG, "STATUS: album art = %s",
+                 track.art_url[0] ? track.art_url : "n/a (no artwork in this tag)");
+    } else {
+        ESP_LOGI(TAG, "STATUS: now playing = n/a (no track metadata received yet for this station)");
+    }
+}
+
 static void resource_log_timer_cb(void *arg)
 {
     (void)arg;
+    log_playback_status();
     size_t dma_free = log_ram_usage("periodic");
 
     /* Self-healing reboot on sustained critical DMA-capable/internal RAM
@@ -284,6 +358,27 @@ static void radio_task(void *pvParameters)
                  esp_err_to_name(prefetch_err));
     }
 
+    /* Same one-time setup pattern as playlist_prefetch_init() just above -
+     * see nowplaying.h. Not fatal on failure: the periodic status log just
+     * keeps reporting no track data (nowplaying_get_current() degrades to
+     * out->valid == false when nowplaying_init() was never called), audio
+     * playback itself is completely unaffected either way. */
+    esp_err_t nowplaying_err = nowplaying_init(esp_crt_bundle_attach);
+    if (nowplaying_err != ESP_OK) {
+        ESP_LOGW(TAG, "nowplaying_init failed: %s; the status log will not show track info",
+                 esp_err_to_name(nowplaying_err));
+    }
+
+    /* Tracks whether the loop below is about to (re)start THE SAME station
+     * or a genuinely different one, so nowplaying_reset() (main.c-line
+     * usage below) only fires on a real switch - see nowplaying.h's own
+     * comment on why a routine same-station session refresh must NOT clear
+     * the currently-displayed track. Deliberately not RADIO_STATION_COUNT
+     * (an impossible value - every real index is < that), so the very
+     * first iteration always counts as "changed" and polls promptly rather
+     * than waiting to be sure. */
+    uint8_t previous_station_idx = (uint8_t)RADIO_STATION_COUNT;
+
     while (true) {
         ESP_LOGI(TAG, "Waiting for Wi-Fi connection");
 
@@ -300,6 +395,15 @@ static void radio_task(void *pvParameters)
          * covers the initial boot selection and every subsequent next/prev/
          * retry-with-same-station pass through this loop in one place. */
         station_list_set_now_playing(current_station_idx);
+        if (current_station_idx != previous_station_idx) {
+            /* A GENUINE station change (or the very first loop pass) - see
+             * nowplaying.h's own comment for why this must not fire on a
+             * routine same-station session refresh (radio_pipeline.c's own
+             * next_nowplaying_poll_tick reset already handles polling
+             * promptly for those without touching what is displayed). */
+            nowplaying_reset();
+            previous_station_idx = current_station_idx;
+        }
         tunein_session_t *session = calloc(1, sizeof(*session));
         if (!session) {
             ESP_LOGE(TAG, "Failed to allocate TuneIn session");

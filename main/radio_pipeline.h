@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -53,3 +54,42 @@ esp_err_t radio_pipeline_start(tunein_session_t *session);
 esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd, bool *out_calibrate);
 
 void radio_pipeline_stop(void);
+
+/*
+ * Snapshot of what the pipeline is actually carrying right now - for
+ * diagnostics/logging only (main.c's periodic resource-headroom log; see
+ * RADIO_RESOURCE_LOG_INTERVAL_MS in app_config.h), not for pipeline control.
+ *
+ * `sample_rate_hz`/`channels` are whatever i2s_writer is CONFIGURED at, i.e.
+ * the CMAF init segment's AudioSpecificConfig on the primary path, or the
+ * decoder's own AEL_MSG_CMD_REPORT_MUSIC_INFO retune on the generic fallback
+ * path (see radio_pipeline_wait()) - either way, the real format actually in
+ * use, not a guess.
+ *
+ * There is no per-frame bitrate metadata available on this path (fmp4_bridge
+ * synthesizes ADTS headers with no bit_rate field, and esp_aac_dec is TOLD
+ * the format rather than parsing one out - see aac_dec_element.h) - so no
+ * bitrate field is exposed here. `http_bytes_total` is http_reader's own
+ * running count of bytes pulled off the wire - monotonic for as long as the
+ * SAME http_reader element instance lives (every full pipeline rebuild, but
+ * NOT an in-place station switch - see switch_cmaf_station_in_place() -
+ * creates a fresh one, restarting this count from 0). The caller can turn a
+ * delta of this across a known time interval into a measured effective
+ * throughput (kbps) - which is what's actually informative for a live HLS
+ * stream: real network throughput including HLS/CMAF container overhead,
+ * not just a nominal per-station figure that may not reflect what's really
+ * arriving - as long as it treats a DECREASE between two reads as "the
+ * element was recreated, discard this interval" rather than a negative rate.
+ *
+ * `active` is false (and every other field left zeroed) when no pipeline is
+ * currently up at all (between sessions, or before the first one).
+ */
+typedef struct {
+    bool active;
+    const char *format_name;   /* e.g. "CMAF/fMP4 AAC-LC (HLS)"; "none" if !active */
+    int sample_rate_hz;
+    int channels;
+    int64_t http_bytes_total;
+} radio_pipeline_stream_stats_t;
+
+void radio_pipeline_get_stream_stats(radio_pipeline_stream_stats_t *out);

@@ -6,6 +6,7 @@ idf_component_register(
         "fmp4_bridge.c"
         "aac_dec_element.c"
         "playlist_prefetch.c"
+        "nowplaying.c"
         "station_list.c"
         "avrcp_uart.c"
         "led_viz.c"
