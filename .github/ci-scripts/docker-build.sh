@@ -28,6 +28,23 @@ PROJECT_DIR="$WORKSPACE/esp32_wifi_streamer"
 ADF_DIR="$WORKSPACE/esp-adf"
 PATCH_DIR="$PROJECT_DIR/.github/ci-patches"
 
+# The bind-mounted workspace is owned by the RUNNER'S host UID (actions/
+# checkout ran there, outside this container), but this container runs as
+# root (no USER in espressif/idf's Dockerfile - see build.yml's comment on
+# that). Git >= 2.35.2's "dubious ownership" check refuses to touch a repo
+# whose directory owner doesn't match the current user for exactly this
+# reason (CVE-2022-24765) - first hit here on the very first `git -C
+# "$ADF_DIR"` call below, before anything else runs: "fatal: detected
+# dubious ownership in repository at '/workspace/esp-adf'". Safe to blanket-
+# trust in this container: it is a throwaway CI environment that exists for
+# the duration of this one job, mounts nothing untrusted, and every repo
+# under /workspace was just checked out fresh by this same workflow run (not
+# supplied by a third party). `*` covers esp32_wifi_streamer, esp-adf,
+# esp-adf/components/esp-adf-libs, AND $IDF_PATH (the image's baked-in
+# /opt/esp/idf, owned by whatever UID built the image, not the bind-mount
+# owner) in one line rather than enumerating each path.
+git config --global --add safe.directory '*'
+
 echo "::group::Versions"
 echo "Container IDF_PATH (baked-in, image-provided): ${IDF_PATH:-<unset>}"
 git -C "$IDF_PATH" describe --tags --always 2>&1 || echo "(esp-idf tree inside the image has no .git metadata - expected for some image variants; version is still pinned by the image tag itself, espressif/idf:v5.5.5)"
