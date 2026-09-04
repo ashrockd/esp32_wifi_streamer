@@ -17,7 +17,6 @@
 #include "audio_event_iface.h"
 #include "http_stream.h"
 #include "i2s_stream.h"
-#include "filter_resample.h"
 #include "ringbuf.h"
 #include "aac_dec_element.h"
 #include "esp_decoder.h"
@@ -48,12 +47,6 @@ static audio_element_handle_t generic_decoder;
  * music-info handler, element_name() and teardown do not each have to
  * re-derive it. */
 static audio_element_handle_t decoder_el;
-/* Only ever created on the generic/fallback decoder path (session->format
- * != TUNEIN_FORMAT_HLS_CMAF_AAC) - see its creation site in
- * radio_pipeline_start() and RADIO_I2S_SAMPLE_RATE's comment in
- * app_config.h for why. NULL on the CMAF path, where the stream is already
- * at the I2S target rate and a resampler would just burn CPU for nothing. */
-static audio_element_handle_t resample_el;
 static audio_element_handle_t i2s_writer;
 static audio_event_iface_handle_t event_iface;
 /* What i2s_writer was actually created with, so the music-info
@@ -384,68 +377,33 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
     } else {
         generic_decoder = build_generic_decoder();
         decoder_el = generic_decoder;
-
-        /* The generic/fallback decoder's real sample rate is not known
-         * until it has parsed a frame (build_generic_decoder()'s own
-         * comment) - some stations turn out to be 44.1kHz, not 48kHz (a
-         * direct '.aac' stream station, confirmed on hardware: "Configuring
-         * I2S master at 44100 Hz... provisional", never retuned to what the
-         * decoder actually reported). This used to be handled by retuning
-         * I2S itself once the real rate was known - i2s_stream_set_clk()
-         * pauses and resumes the element, and that resume has been observed
-         * timing out on hardware ("[i2s-...] RESUME timeout"), wedging the
-         * output with no error. A resampler avoids that path entirely: I2S
-         * is created once below, always at RADIO_I2S_SAMPLE_RATE, and never
-         * touched again - this element absorbs whatever rate the decoder
-         * actually reports instead (see rsp_filter_set_src_info() in the
-         * music-info handler below, called every time the decoder's
-         * reported format changes). src_rate/src_ch here are just an
-         * initial guess, corrected the moment the decoder reports for
-         * real - only dest_rate/dest_ch (the fixed I2S target) actually
-         * matter at this point. */
-        rsp_filter_cfg_t rsp_cfg = DEFAULT_RESAMPLE_FILTER_CONFIG();
-        rsp_cfg.src_rate    = RADIO_I2S_SAMPLE_RATE;
-        rsp_cfg.src_ch      = 2;
-        rsp_cfg.src_bits    = 16;
-        rsp_cfg.dest_rate   = RADIO_I2S_SAMPLE_RATE;
-        rsp_cfg.dest_ch     = 2;
-        rsp_cfg.dest_bits   = 16;
-        rsp_cfg.out_rb_size = RADIO_RESAMPLE_BUFFER_BYTES;
-        resample_el = rsp_filter_init(&rsp_cfg);
-        if (!resample_el) {
-            ESP_LOGE(TAG, "rsp_filter allocation failed");
-        }
     }
 
     /* I2S MASTER (this chip drives BCLK/WS/DOUT) - the companion
      * esp32_bt_speaker chip just listens as slave. Pins from app_config.h,
      * must match that project's pins and the physical wiring exactly. */
-    /* Fixed at RADIO_I2S_SAMPLE_RATE, always, on BOTH paths - created once
-     * here and never retuned again for the life of this pipeline. Retuning
-     * mid-run (i2s_stream_set_clk()) is actively harmful: it pauses and
+    /* Configure the bus at the stream's ACTUAL rate up front. The init
+     * segment was parsed above, so the real rate (48000 for this stream) is
+     * already known - there is no reason to start at RADIO_I2S_SAMPLE_RATE
+     * and retune later. Retuning mid-run is in fact harmful: it pauses and
      * resumes the element, and on hardware that resume timed out -
      * "AUDIO_ELEMENT: [i2s-...] RESUME timeout" - leaving I2S wedged so no
-     * samples reached the pins even though the stream kept downloading.
-     * That is no longer a risk this pipeline takes, on either path:
-     *   - CMAF path: the init segment parsed above already gives the real
-     *     rate before I2S is ever created, and every station observed on
-     *     this path is 48kHz already (freq_index=3 in every fmp4_bridge
-     *     log seen so far) - matching RADIO_I2S_SAMPLE_RATE exactly, so
-     *     there is nothing to reconcile.
-     *   - Generic/fallback path: the real rate is not known until the
-     *     decoder parses a frame, well after I2S already exists - some
-     *     stations turn out to be 44.1kHz (hardware-confirmed), not 48kHz.
-     *     resample_el (created above) absorbs that difference instead of
-     *     I2S ever changing - see the music-info handler in
-     *     radio_pipeline_wait() below, which retargets the resampler, not
-     *     the I2S bus, whenever the decoder's reported format changes. */
-    ESP_LOGI(TAG, "Configuring I2S master at %d Hz, %d ch (fixed - %s)",
-             RADIO_I2S_SAMPLE_RATE, 2,
-             fmp4_bridge_el ? "matches the CMAF init segment" : "resample_el absorbs whatever the decoder reports");
-    i2s_configured_rate = RADIO_I2S_SAMPLE_RATE;
-    i2s_configured_ch = 2;
+     * samples reached the pins even though the stream kept downloading. */
+    /* Only the CMAF path knows the real rate up front (from the init
+     * segment). On the generic path nothing has parsed a frame yet, so the
+     * bus starts at RADIO_I2S_SAMPLE_RATE and the music-info handler in
+     * radio_pipeline_wait() retunes it once the decoder reports the truth. */
+    int stream_rate = fmp4_bridge_el ? fmp4_bridge_get_sample_rate(fmp4_bridge_el) : 0;
+    int stream_ch   = fmp4_bridge_el ? fmp4_bridge_get_channels(fmp4_bridge_el) : 0;
+    if (stream_rate <= 0) stream_rate = RADIO_I2S_SAMPLE_RATE;
+    if (stream_ch   <= 0) stream_ch   = 2;
+    ESP_LOGI(TAG, "Configuring I2S master at %d Hz, %d ch (%s)",
+             stream_rate, stream_ch,
+             fmp4_bridge_el ? "from CMAF init segment" : "provisional - retuned when the decoder reports the real format");
+    i2s_configured_rate = stream_rate;
+    i2s_configured_ch = stream_ch;
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(
-        I2S_NUM_0, RADIO_I2S_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, AUDIO_STREAM_WRITER);
+        I2S_NUM_0, stream_rate, I2S_DATA_BIT_WIDTH_16BIT, AUDIO_STREAM_WRITER);
     i2s_cfg.chan_cfg.role = I2S_ROLE_MASTER;
     i2s_cfg.std_cfg.gpio_cfg.bclk = RADIO_I2S_BCLK_GPIO;
     i2s_cfg.std_cfg.gpio_cfg.ws = RADIO_I2S_WS_GPIO;
@@ -478,63 +436,44 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
     ESP_LOGI(TAG, "I2S element created: %p | free heap=%" PRIu32 ", largest block=%" PRIu32,
              i2s_writer, esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-    /* resample_el is only ever created on the generic path (fmp4_bridge_el
-     * NULL) - required there, never created (nor missed) on the CMAF path. */
-    bool needs_resample = (fmp4_bridge_el == NULL);
-    if (!http_reader || !decoder_el || !i2s_writer || (needs_resample && !resample_el)) {
-        ESP_LOGE(TAG, "Pipeline element allocation failed (HTTP=%p FMP4=%p DEC=%p RSP=%p I2S=%p)",
-                 http_reader, fmp4_bridge_el, decoder_el, resample_el, i2s_writer);
+    if (!http_reader || !decoder_el || !i2s_writer) {
+        ESP_LOGE(TAG, "Pipeline element allocation failed (HTTP=%p FMP4=%p DEC=%p I2S=%p)",
+                 http_reader, fmp4_bridge_el, decoder_el, i2s_writer);
         radio_pipeline_stop();
         return ESP_ERR_NO_MEM;
     }
 
-    /* fmp4_bridge and resample_el are mutually exclusive (CMAF vs generic
-     * path - see their own comments), so the chain is always exactly 4
-     * elements, just a different 4th one depending on which path this is -
-     * registered and linked accordingly rather than assuming either is
-     * present. */
+    /* fmp4_bridge only exists on the CMAF path, so the chain is 4 elements
+     * there and 3 on the generic one - registered and linked accordingly
+     * rather than always assuming the bridge is present. */
     ESP_ERROR_CHECK(audio_pipeline_register(pipeline, http_reader, "hls"));
     if (fmp4_bridge_el) {
         ESP_ERROR_CHECK(audio_pipeline_register(pipeline, fmp4_bridge_el, "fmp4"));
     }
     ESP_ERROR_CHECK(audio_pipeline_register(pipeline, decoder_el, "dec"));
-    if (resample_el) {
-        ESP_ERROR_CHECK(audio_pipeline_register(pipeline, resample_el, "rsp"));
-    }
     ESP_ERROR_CHECK(audio_pipeline_register(pipeline, i2s_writer, "i2s"));
     if (fmp4_bridge_el) {
         const char *links[] = {"hls", "fmp4", "dec", "i2s"};
-        ESP_ERROR_CHECK(audio_pipeline_link(pipeline, links, 4));
-    } else if (resample_el) {
-        const char *links[] = {"hls", "dec", "rsp", "i2s"};
         ESP_ERROR_CHECK(audio_pipeline_link(pipeline, links, 4));
     } else {
         const char *links[] = {"hls", "dec", "i2s"};
         ESP_ERROR_CHECK(audio_pipeline_link(pipeline, links, 3));
     }
 
-    /* Tap the PCM feeding I2S for the LED visualiser - resample_el's output
-     * when it exists (the generic path: what actually reaches I2S there is
-     * resampled audio, not the decoder's raw output, and led_viz's own
-     * timing math assumes it is looking at RADIO_I2S_SAMPLE_RATE PCM),
-     * otherwise the decoder's own output (CMAF path, already at that rate).
-     * Must happen AFTER audio_pipeline_link() above: that call is what
-     * creates the ring buffer between this element and i2s_writer, and the
-     * callback needs that same buffer as its write target so the data path
-     * is unchanged. Decorative, so a missing ring buffer is a warning,
-     * never a failure. */
-    audio_element_handle_t pcm_tap_el = resample_el ? resample_el : decoder_el;
-    ringbuf_handle_t decoder_out_rb = audio_element_get_output_ringbuf(pcm_tap_el);
+    /* Tap the decoder's PCM for the LED visualiser. Must happen AFTER
+     * audio_pipeline_link() above: that call is what creates the ring buffer
+     * between the decoder and i2s_writer, and the callback needs that same
+     * buffer as its write target so the data path is unchanged. Decorative,
+     * so a missing ring buffer is a warning, never a failure. */
+    ringbuf_handle_t decoder_out_rb = audio_element_get_output_ringbuf(decoder_el);
     if (decoder_out_rb) {
-        esp_err_t tap_err = audio_element_set_write_cb(pcm_tap_el, led_viz_write_cb, decoder_out_rb);
+        esp_err_t tap_err = audio_element_set_write_cb(decoder_el, led_viz_write_cb, decoder_out_rb);
         if (tap_err != ESP_OK) {
-            ESP_LOGW(TAG, "Could not tap %s output for the LED visualiser: %s "
-                     "(audio unaffected; the LED just will not react)",
-                     resample_el ? "resampler" : "decoder", esp_err_to_name(tap_err));
+            ESP_LOGW(TAG, "Could not tap decoder output for the LED visualiser: %s "
+                     "(audio unaffected; the LED just will not react)", esp_err_to_name(tap_err));
         }
     } else {
-        ESP_LOGW(TAG, "%s has no output ring buffer; LED visualiser will not react",
-                 resample_el ? "Resampler" : "Decoder");
+        ESP_LOGW(TAG, "Decoder has no output ring buffer; LED visualiser will not react");
     }
 
     /* The resolved media playlist (not the HLS master), or the direct
@@ -632,7 +571,6 @@ static const char *element_name(audio_element_handle_t el)
     if (el == http_reader) return "hls";
     if (fmp4_bridge_el && el == fmp4_bridge_el) return "fmp4";
     if (decoder_el && el == decoder_el) return "dec";
-    if (resample_el && el == resample_el) return "rsp";
     if (el == i2s_writer) return "i2s";
     return "?";
 }
@@ -817,59 +755,41 @@ esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_sta
         }
 
         /* The decoder reports the stream's real sample rate/width/channels
-         * once it has parsed a frame. This is not hypothetical: a
-         * hardware-confirmed direct '.aac' station streams at 44.1kHz, not
-         * RADIO_I2S_SAMPLE_RATE's 48kHz - an ~8.8% pitch/speed error if left
-         * uncorrected. Without this filter the message was silently dropped
-         * below (only AEL_MSG_CMD_REPORT_STATUS is handled there). */
+         * once it has parsed a frame; the I2S clock has to be retuned to
+         * match or output plays at the wrong pitch/speed. This is not
+         * hypothetical for this stream: the CMAF init segment parses as
+         * freq_index=3 (48 kHz), while RADIO_I2S_SAMPLE_RATE only sets the
+         * bus up at 44.1 kHz initially - an ~8.8% error left uncorrected.
+         * Without this the message was silently dropped by the filter below. */
         if (msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO &&
             decoder_el && (audio_element_handle_t)msg.source == decoder_el) {
             audio_element_info_t music_info = {0};
             audio_element_getinfo(decoder_el, &music_info);
+            /* The I2S element was already created at this rate from the init
+             * segment, so normally there is nothing to do. Only retune on a
+             * genuine mismatch: i2s_stream_set_clk() pauses and resumes the
+             * element, and that resume has been observed timing out on
+             * hardware ("[i2s-...] RESUME timeout"), which wedges the output.
+             * Never pay that cost just to set the value it already has. */
             if (music_info.sample_rates == i2s_configured_rate &&
                 music_info.channels == i2s_configured_ch) {
-                ESP_LOGI(TAG, "Decoder confirms %d Hz, %d ch - already at the I2S target, nothing to do",
+                ESP_LOGI(TAG, "Decoder confirms %d Hz, %d ch - I2S already configured, no retune",
                          music_info.sample_rates, music_info.channels);
                 continue;
             }
-            if (resample_el && music_info.sample_rates > 0 && music_info.channels > 0) {
-                /* Retarget the resampler, NOT the I2S bus - see resample_el's
-                 * own comment (its creation site above) for the full why.
-                 * Unlike i2s_stream_set_clk(), this never pauses/resumes any
-                 * element: rsp_filter_set_src_info() just marks the filter's
-                 * internal state dirty, and the SAME task quietly closes and
-                 * reopens its own resample handle in place on its next
-                 * process() call (filter_resample.c) - no hardware-wedging
-                 * risk. I2S itself was created once at RADIO_I2S_SAMPLE_RATE
-                 * above and is never touched again for the life of this
-                 * pipeline. */
-                ESP_LOGI(TAG, "Decoder reports %d Hz, %d ch - retargeting the resampler "
-                         "(I2S stays fixed at %d Hz, %d ch)",
-                         music_info.sample_rates, music_info.channels,
-                         i2s_configured_rate, i2s_configured_ch);
-                esp_err_t rsp_err = rsp_filter_set_src_info(resample_el, music_info.sample_rates,
-                                                            music_info.channels);
-                if (rsp_err != ESP_OK) {
-                    ESP_LOGW(TAG, "rsp_filter_set_src_info failed: %s", esp_err_to_name(rsp_err));
-                }
-                continue;
-            }
-            /* Only the CMAF path (no resample_el) can reach here, and only
-             * on a genuine anomaly - its real rate is already known from the
-             * init segment before I2S is ever created, and every CMAF
-             * station observed so far matches RADIO_I2S_SAMPLE_RATE exactly.
-             * Deliberately NOT calling i2s_stream_set_clk() here any more:
-             * it pauses and resumes the element, and that resume has been
-             * observed timing out on hardware ("[i2s-...] RESUME timeout"),
-             * wedging the output. Log loudly so a real mismatch is visible
-             * instead of silently mis-pitched audio; a full session refresh
-             * (which rebuilds I2S at the right rate from a fresh init
-             * segment) is the safe way to recover, not a live retune. */
-            ESP_LOGE(TAG, "Decoder reports %d Hz, %d ch but I2S is fixed at %d Hz, %d ch and this "
-                     "path has no resampler to absorb the difference - unexpected on the CMAF path; "
-                     "ignoring (a session refresh will rebuild I2S at the right rate)",
-                     music_info.sample_rates, music_info.channels,
+            ESP_LOGW(TAG, "Decoder reports %d Hz, %d bit, %d ch but I2S was set up for %d Hz, %d ch; retuning",
+                     music_info.sample_rates, music_info.bits, music_info.channels,
                      i2s_configured_rate, i2s_configured_ch);
+            if (music_info.sample_rates > 0 && music_info.channels > 0) {
+                esp_err_t clk_err = i2s_stream_set_clk(i2s_writer, music_info.sample_rates,
+                                                       music_info.bits, music_info.channels);
+                if (clk_err != ESP_OK) {
+                    ESP_LOGW(TAG, "i2s_stream_set_clk failed: %s", esp_err_to_name(clk_err));
+                } else {
+                    i2s_configured_rate = music_info.sample_rates;
+                    i2s_configured_ch = music_info.channels;
+                }
+            }
             continue;
         }
 
@@ -1013,11 +933,6 @@ void radio_pipeline_stop(void)
     if (decoder_el) {
         audio_pipeline_unregister(pipeline, decoder_el);
     }
-    /* Only ever registered on the generic path (see radio_pipeline_start) -
-     * same NULL-guard reasoning as fmp4_bridge_el/decoder_el above. */
-    if (resample_el) {
-        audio_pipeline_unregister(pipeline, resample_el);
-    }
     audio_pipeline_unregister(pipeline, i2s_writer);
     if (event_iface) {
         /* Drop the AVRCP + console doorbells before the listener they point
@@ -1043,9 +958,6 @@ void radio_pipeline_stop(void)
     if (decoder_el) {
         audio_element_deinit(decoder_el);
     }
-    if (resample_el) {
-        audio_element_deinit(resample_el);
-    }
     /* Unlike the single-chip project's bt_writer, i2s_writer has no
      * "can only be created once per process" restriction - safe to fully
      * deinit and recreate fresh every session. */
@@ -1056,7 +968,6 @@ void radio_pipeline_stop(void)
     aac_decoder = NULL;
     generic_decoder = NULL;
     decoder_el = NULL;
-    resample_el = NULL;
     i2s_writer = NULL;
 
     ESP_LOGI(TAG, "Pipeline torn down; free heap=%" PRIu32, esp_get_free_heap_size());
