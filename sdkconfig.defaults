@@ -1,12 +1,93 @@
-# ESP32-WROOM-32U: Wi-Fi/streaming half of the two-chip split. 4MB flash, no
-# PSRAM. No Bluetooth stack at all on this chip - see ../esp32_bt_speaker for
-# that half, connected over I2S (see RADIO_I2S_*_GPIO in main/app_config.h).
+# ESP32-S3-WROOM-1 N16R8: Wi-Fi/streaming half of the two-chip split. 16MB
+# flash, 8MB octal PSRAM. No Bluetooth stack at all on this chip - see
+# ../esp32_bt_speaker for that half, connected over I2S (see RADIO_I2S_*_GPIO
+# in main/app_config.h - pin numbers changed for this chip, re-read that
+# comment before wiring).
+#
+# 2026-08-22: migrated from an ESP32-WROOM-32U (4MB flash, no PSRAM).
 
-# Real hardware: 4MB flash, no PSRAM.
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+# 2026-09-01: the target is PINNED here as well as being passed to
+# `idf.py set-target esp32s3`. It used to be set only by that command, on the
+# reasoning that a target cannot be selected from within sdkconfig - which is
+# true for SWITCHING targets, but not for the default used when sdkconfig is
+# regenerated from scratch. That gap bit: build.ps1 deletes sdkconfig on every
+# run, and when its set-target died partway (a stale idf_monitor holding
+# build/log open - see the serial-port notes), the next plain `idf.py build`
+# regenerated sdkconfig with NO target information and silently fell back to
+# IDF's default, esp32. It built cleanly and completely - for the wrong chip,
+# with the S3-only PSRAM options above quietly dropped as "unknown kconfig
+# symbol". The only visible symptom was `--chip esp32` in the flash hint at
+# the very end. Pinning it here makes that failure impossible rather than
+# merely unlikely.
+CONFIG_IDF_TARGET="esp32s3"
+
+# Real hardware: 16MB flash, 8MB octal PSRAM.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# N16R8 = octal SPI PSRAM (the "R8" die needs all 8 data lines - a plain
+# quad-PSRAM module would just be CONFIG_SPIRAM_MODE_QUAD here instead).
+# Speed left at the safe 80MHz default rather than reaching for octal's
+# faster DDR modes sight-unseen on hardware not in hand yet.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# Makes plain malloc()/calloc() (not just ESP-ADF's own audio_calloc(), see
+# main/app_config.h's file-header comment) spill to PSRAM above IDF's usual
+# size threshold - this is what lets mbedTLS's 16KB TLS record buffer and
+# esp_aac_dec_open()'s ~51KB internal allocation (both plain malloc callers,
+# both closed-source, both named in this project's whole OOM history) land in
+# the 8MB pool instead of competing for internal DRAM.
+CONFIG_SPIRAM_USE_MALLOC=y
+# Lets FreeRTOS task stacks live in PSRAM too - radio_task's 16KB stack
+# (main.c) no longer has to come out of internal DRAM.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# ESP-ADF's audio_board component defaults to "ESP32-Lyrat V4.3" - a
+# reference dev board this project has never used (no codec/amp chip, no
+# board_pins_config.c - radio_pipeline.c configures I2S directly from
+# app_config.h's own pins). That default is also classic-ESP32-only: its
+# board_pins_config.c hardcodes GPIO_NUM_22/23/25, which don't exist in the
+# ESP32-S3's gpio_num_t and fail the build.
+#
+# Tried CONFIG_AUDIO_BOARD_CUSTOM=y first (compiles audio_board to nothing,
+# which is really what this project wants - it uses none of ADF's board
+# abstraction). That does NOT work: esp_peripherals is a hard PRIV_REQUIRES
+# of audio_board regardless of which board is chosen (see audio_board's
+# CMakeLists.txt - that REQUIRES line isn't inside any per-board `if`), and
+# esp_peripherals compiles ALL of its periph_*.c files unconditionally, not
+# just ones for hardware a board actually has. Several of them (e.g.
+# periph_lcd.c) unconditionally `#include "board.h"`, which only exists
+# inside a real board's own subdirectory - "custom" provides none, so the
+# build fails with "board.h: No such file or directory" before it ever gets
+# to our own code.
+#
+# So a real board has to be selected - just one whose board.h/
+# board_pins_config.c actually compile for this chip. Tried ESP32-S3-Korvo-2
+# v3 first (2026-08-22) - it looked ideal (native S3 board, pins expressed as
+# I2C GPIO-expander bits rather than raw GPIO_NUM_*) but its board.c
+# #include "esp_lcd_ili9341.h", an external managed component that ESP-ADF's
+# own audio_board/CMakeLists.txt never lists in PRIV_REQUIRES (a gap in that
+# vendored file - see build.ps1's build log from 2026-08-31 for the exact
+# ninja error). ESP-IDF's component manager can fetch the package fine from a
+# project-level idf_component.yml, but that alone doesn't satisfy the
+# per-component REQUIRES ninja enforces - actually fixing it means editing
+# esp-adf/components/audio_board/CMakeLists.txt itself, which is shared with
+# ../esp32_bt_speaker and not something to patch for one side's build.
+#
+# Switched (2026-08-31) to M5Stack-AtomS3R instead: also a real ESP32-S3
+# board, and its board.c only touches periph_sdcard.h/periph_adc_button.h/
+# tca9554.h - all already proven to compile - with zero external managed
+# dependencies. Its board_def.h leaves every pin GPIO_NUM_NC (not connected),
+# so there's no risk of it coincidentally claiming app_config.h's I2S pins
+# either. Same as before: none of its board.c hardware-init code ever
+# actually runs - this project never calls audio_board_init() or anything
+# else from audio_board/ - it only needs to compile and link.
+CONFIG_M5STACK_ATOMS3R_BOARD=y
+# CONFIG_ESP32_S3_KORVO2_V3_BOARD is not set
+# CONFIG_ESP_LYRAT_V4_3_BOARD is not set
 
 # Optimize for size, not speed - tight flash/IRAM budget on this board.
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y

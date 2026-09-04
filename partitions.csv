@@ -1,5 +1,10 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 2M,
-storage,  data, spiffs,          , 0x100000,
+# 2026-08-22: widened for the ESP32-S3-WROOM-1 N16R8's 16MB flash (was sized
+# for the WROOM-32U's 4MB). nvs/phy_init offsets unchanged - no reason to
+# move them. factory and storage both grown generously; ~4MB is still left
+# unused past 'storage' as slack for a future OTA slot/coredump partition
+# rather than committing every byte now.
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,
+storage,  data, spiffs,  0x410000, 0x800000,

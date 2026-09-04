@@ -5,17 +5,26 @@ idf_component_register(
         "radio_pipeline.c"
         "fmp4_bridge.c"
         "aac_dec_element.c"
+        "playlist_prefetch.c"
+        "station_list.c"
+        "avrcp_uart.c"
+        "led_viz.c"
+        "console_cli.c"
     INCLUDE_DIRS "."
     REQUIRES
         app_update
         audio_pipeline
         audio_stream
+        console
         driver
         esp_event
         esp_http_client
         esp_netif
+        esp_driver_rmt
+        esp_partition
         esp_wifi
         json
         mbedtls
         nvs_flash
+        spi_flash
 )

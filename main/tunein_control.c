@@ -204,29 +204,53 @@ static bool extract_item_token(const char *json, char *token, size_t token_size)
     return url_decode_until(found + strlen(marker), token, token_size);
 }
 
-static bool extract_hls_url(const char *json, char *url, size_t url_size)
+/*
+ * Finds the first "https://..." URL in json that contains `marker` (e.g.
+ * ".m3u8", ".mp3") and copies it out whole, query string included.
+ *
+ * Each candidate URL is bounded FIRST - from "https://" up to the closing
+ * quote/backslash/whitespace that ends it in the JSON - and the marker is
+ * then looked for only inside that span. The bounding matters now that more
+ * than one marker is searched for (see tunein_start_session()'s direct-
+ * stream fallback): searching the unbounded remainder of the document would
+ * happily match a marker belonging to a LATER url and return everything
+ * from here to there as one giant "URL". For the original single-marker
+ * .m3u8 case the result is byte-for-byte what it always was, since that
+ * marker is inside the first URL either way.
+ */
+static bool extract_url_with_marker(const char *json, const char *marker, char *url, size_t url_size)
 {
     const char *start = strstr(json, "https://");
 
     while (start) {
-        const char *m3u8 = strstr(start, ".m3u8");
+        const char *end = start;
+        while (*end && *end != '"' && *end != '\\' && *end != ' ' &&
+               *end != '\t' && *end != '\r' && *end != '\n' && *end != '<') {
+            end++;
+        }
 
-        if (m3u8) {
-            const char *end = m3u8 + strlen(".m3u8");
-            while (*end && *end != '"' && *end != '\\') end++;
-
-            size_t length = (size_t)(end - start);
-            if (length + 1 > url_size) return false;
-
+        size_t length = (size_t)(end - start);
+        if (length + 1 <= url_size) {
+            /* Copy first, then search the copy: the span is not NUL-
+             * terminated in place, so strstr() over the original would run
+             * straight past `end` into the rest of the document. */
             memcpy(url, start, length);
             url[length] = '\0';
-            return true;
+            if (strstr(url, marker)) {
+                return true;
+            }
         }
 
         start = strstr(start + 8, "https://");
     }
 
+    url[0] = '\0';
     return false;
+}
+
+static bool extract_hls_url(const char *json, char *url, size_t url_size)
+{
+    return extract_url_with_marker(json, ".m3u8", url, url_size);
 }
 
 static void make_serial(char *serial, size_t serial_size)
@@ -463,7 +487,7 @@ static esp_err_t resolve_hls_variant_and_init(tunein_session_t *session)
         err = ESP_ERR_NOT_SUPPORTED;
         goto cleanup;
     }
-    tunein_log_url("HLS variant (AAC-LC) playlist", session->hls_variant_url, false);
+    tunein_log_url("HLS variant playlist", session->hls_variant_url, false);
     body_free(&master);
 
     status = 0;
@@ -474,10 +498,24 @@ static esp_err_t resolve_hls_variant_and_init(tunein_session_t *session)
     }
 
     if (!extract_map_uri(variant.data, init_url, sizeof(init_url))) {
-        ESP_LOGE(TAG, "No EXT-X-MAP init segment URI found in HLS variant playlist");
-        err = ESP_ERR_NOT_FOUND;
+        /* No EXT-X-MAP: the segments are not CMAF/fMP4, so there is no
+         * AudioSpecificConfig to prime fmp4_bridge with and no reason to
+         * involve it. Bare ADTS AAC and MPEG-TS segments are both
+         * self-describing, so they go straight into esp_decoder, which
+         * sniffs the codec itself - see TUNEIN_FORMAT_HLS_GENERIC in
+         * tunein_control.h and the chain radio_pipeline_start() builds for
+         * it. This used to be a hard ESP_ERR_NOT_FOUND. */
+        ESP_LOGW(TAG, "No EXT-X-MAP in the HLS variant playlist - segments are not CMAF/fMP4; "
+                 "using ESP-ADF's auto-detecting decoder instead of the fMP4 bridge");
+        session->format = TUNEIN_FORMAT_HLS_GENERIC;
+        session->init_segment_len = 0;
+        body_free(&variant);
+        session->resolved_at_us = esp_timer_get_time();
+        err = ESP_OK;
         goto cleanup;
     }
+
+    session->format = TUNEIN_FORMAT_HLS_CMAF_AAC;
     tunein_log_url("CMAF init segment", init_url, false);
     body_free(&variant);
 
@@ -557,8 +595,54 @@ static void test_dns(void)
     freeaddrinfo(result);
 }
 
-esp_err_t tunein_start_session(tunein_session_t *session)
+/*
+ * Fallback for a Tune.ashx response with no .m3u8 in it at all: TuneIn
+ * handed back a direct, continuous media stream rather than an HLS
+ * playlist. Looks for a URL ending in a container this build can actually
+ * decode and records it as TUNEIN_FORMAT_DIRECT_GENERIC.
+ *
+ * The markers are tried most-specific first, and the list is deliberately
+ * limited to what ESP-ADF's own esp_decoder ships a decoder for (see
+ * radio_pipeline.c's build_generic_decoder()) - there is no point matching
+ * a container nothing downstream can open. ".mp4" and ".m4a" are the same
+ * decoder (ESP_CODEC_TYPE_M4A); both spellings appear in the wild.
+ *
+ * Deliberately NOT matched: .pls and .asx playlist wrappers. http_stream's
+ * own playlist parser could follow those, but they are a redirect layer
+ * rather than a stream, and this project has no station that needs one -
+ * matching them would mean claiming success here for a URL that still
+ * might not resolve to anything playable.
+ */
+static bool resolve_direct_stream(tunein_session_t *session, const char *tune_json)
 {
+    static const char *const markers[] = {
+        ".aac", ".m4a", ".mp4", ".mp3", ".flac", ".opus", ".ogg", ".wav",
+    };
+
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+        if (extract_url_with_marker(tune_json, markers[i],
+                                    session->hls_variant_url,
+                                    sizeof(session->hls_variant_url))) {
+            session->format = TUNEIN_FORMAT_DIRECT_GENERIC;
+            session->init_segment_len = 0;
+            ESP_LOGW(TAG, "Tune.ashx returned no HLS playlist; falling back to a direct '%s' stream "
+                     "(codec auto-detected by ESP-ADF's esp_decoder)", markers[i]);
+            tunein_log_url("TuneIn session resolved direct stream", session->hls_variant_url, false);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+esp_err_t tunein_start_session(tunein_session_t *session, const char *station_id)
+{
+    /* NULL keeps the pre-multi-station behavior (and any caller that has no
+     * station list of its own) working unchanged. */
+    if (!station_id) {
+        station_id = RADIO_TUNEIN_STATION_ID;
+    }
+
     esp_err_t err = ESP_FAIL;
     int status = 0;
     http_body_t profile = {0};
@@ -577,6 +661,7 @@ esp_err_t tunein_start_session(tunein_session_t *session)
 
     memset(session, 0, sizeof(*session));
     make_serial(session->serial, sizeof(session->serial));
+    snprintf(session->station_id, sizeof(session->station_id), "%s", station_id);
 
     uint64_t unix_or_uptime = (uint64_t)time(NULL);
     if (unix_or_uptime < 1700000000) {
@@ -589,7 +674,7 @@ esp_err_t tunein_start_session(tunein_session_t *session)
 
     ESP_LOGI(TAG,
              "Starting TuneIn session: station=%s serial=%s listenId=%s",
-             RADIO_TUNEIN_STATION_ID,
+             station_id,
              session->serial,
              session->listen_id);
 
@@ -598,7 +683,7 @@ esp_err_t tunein_start_session(tunein_session_t *session)
         4096,
         "https://api.tunein.com/profiles/%s/contents?"
         "itemUrlScheme=secure&serial=%s&partnerId=%s&version=%s&formats=%s",
-        RADIO_TUNEIN_STATION_ID,
+        station_id,
         session->serial,
         RADIO_TUNEIN_PARTNER_ID,
         RADIO_TUNEIN_VERSION,
@@ -650,7 +735,7 @@ esp_err_t tunein_start_session(tunein_session_t *session)
         "https://opml.radiotime.com/Tune.ashx?"
         "id=%s&itemToken=%s&listenId=%s&itemUrlScheme=secure&serial=%s"
         "&partnerId=%s&version=%s&formats=%s&render=json",
-        RADIO_TUNEIN_STATION_ID,
+        station_id,
         encoded_token,
         session->listen_id,
         session->serial,
@@ -676,25 +761,32 @@ esp_err_t tunein_start_session(tunein_session_t *session)
 	ESP_LOGI(TAG, "Tune.ashx response received: %u bytes",
              (unsigned)tune.length);
 
-    if (!extract_hls_url(tune.data,
-                         session->hls_master_url,
-                         sizeof(session->hls_master_url))) {
+    if (extract_hls_url(tune.data,
+                        session->hls_master_url,
+                        sizeof(session->hls_master_url))) {
+        tunein_log_url(
+            "TuneIn session resolved HLS master",
+            session->hls_master_url,
+            false
+        );
+
+        err = resolve_hls_variant_and_init(session);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to resolve HLS variant/init segment: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+    } else if (resolve_direct_stream(session, tune.data)) {
+        /* Not HLS at all - Tune.ashx pointed straight at one continuous
+         * media stream. Nothing more to resolve: the URL goes to
+         * http_stream as-is and esp_decoder works out the codec. */
+        session->resolved_at_us = esp_timer_get_time();
+        err = ESP_OK;
+    } else {
         ESP_LOGE(TAG,
-                 "Tune.ashx returned no HLS URL; bytes=%u",
+                 "Tune.ashx returned no playable stream URL (no .m3u8 and no known direct "
+                 "container extension); bytes=%u",
                  (unsigned)tune.length);
         err = ESP_ERR_NOT_FOUND;
-        goto cleanup;
-    }
-
-    tunein_log_url(
-        "TuneIn session resolved HLS master",
-        session->hls_master_url,
-        false
-    );
-
-    err = resolve_hls_variant_and_init(session);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to resolve HLS variant/init segment: %s", esp_err_to_name(err));
         goto cleanup;
     }
 

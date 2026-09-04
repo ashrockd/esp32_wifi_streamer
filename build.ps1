@@ -1,19 +1,24 @@
 <#
-  build.ps1 - one-shot ESP32-WROOM-32U (4MB flash, no PSRAM) build script
-  for esp32_wifi_streamer - the Wi-Fi/streaming half of the two-chip split.
-  Reuses the ESP-ADF/ESP-IDF checkout vendored one level up in
-  ..\esp-adf rather than duplicating it.
+  build.ps1 - one-shot ESP32-S3-WROOM-1 N16R8 (16MB flash, 8MB octal PSRAM)
+  build script for esp32_wifi_streamer - the Wi-Fi/streaming half of the
+  two-chip split. Reuses the ESP-ADF/ESP-IDF checkout vendored one level up
+  in ..\esp-adf rather than duplicating it.
+
+  2026-08-22: migrated from an ESP32-WROOM-32U (4MB flash, no PSRAM) - see
+  sdkconfig.defaults/main/app_config.h for what that changed. Port default
+  below corrected to this project's actual port (COM10, CH340) - it used to
+  read COM7, which is esp32_bt_speaker's port, not this project's.
 
   Usage:
     powershell -NoExit -ExecutionPolicy Bypass -File "C:\Users\Ashish\Github\esp32_bt_int_radio\esp32_wifi_streamer\build.ps1"
-    powershell -NoExit -ExecutionPolicy Bypass -File "...\build.ps1" -Flash -Port COM7
+    powershell -NoExit -ExecutionPolicy Bypass -File "...\build.ps1" -Flash -Port COM10
     powershell -NoExit -ExecutionPolicy Bypass -File "...\build.ps1" -Clean
 #>
 
 param(
     [switch]$Clean,          # wipe build/ and managed_components/ before building (use after dependency/space issues)
     [switch]$Flash,          # flash + monitor after a successful build
-    [string]$Port = "COM7"   # serial port to use with -Flash
+    [string]$Port = "COM10"  # serial port to use with -Flash
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,7 +67,7 @@ if ($Clean) {
 Write-Host "== Regenerating sdkconfig from sdkconfig.defaults ==" -ForegroundColor Cyan
 Remove-Item -Force "sdkconfig" -ErrorAction SilentlyContinue
 
-idf.py set-target esp32
+idf.py set-target esp32s3
 if ($LASTEXITCODE -ne 0) { Write-Error "set-target failed"; exit $LASTEXITCODE }
 
 Write-Host "== Building ==" -ForegroundColor Cyan

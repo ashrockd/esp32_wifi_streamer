@@ -93,8 +93,19 @@ static esp_err_t aac_dec_destroy(audio_element_handle_t self)
         if (d->opened) {
             esp_aac_dec_close(d->dec);
         }
-        if (d->in_buf)  audio_free(d->in_buf);
-        if (d->pcm_buf) audio_free(d->pcm_buf);
+        if (d->in_buf) {
+            audio_free(d->in_buf);
+            d->in_buf = NULL;
+        }
+        if (d->pcm_buf) {
+            audio_free(d->pcm_buf);
+            d->pcm_buf = NULL;
+        }
+        /* Clear the element's back-pointer before freeing what it points at,
+         * so a second destroy (or anything else that reaches for the private
+         * state after teardown) sees NULL rather than a dangling pointer. */
+        audio_element_setdata(self, NULL);
+        d->dec = NULL;
         audio_free(d);
     }
     return ESP_OK;
@@ -104,6 +115,18 @@ static audio_element_err_t aac_dec_process(audio_element_handle_t self,
                                            char *el_buffer, int el_buf_len)
 {
     aac_dec_t *d = (aac_dec_t *)audio_element_getdata(self);
+
+    /* in_fill must always be a valid index into a AAC_DEC_IN_BYTES buffer.
+     * Nothing should be able to violate that any more (see the clamps in the
+     * decode loop and the slide below), but check on the way in too: this is
+     * the value every memmove()/pointer arithmetic in this function is
+     * derived from, so a single bad one corrupts the heap rather than
+     * producing bad audio. */
+    if (d->in_fill < 0 || d->in_fill > AAC_DEC_IN_BYTES) {
+        ESP_LOGE(TAG, "in_fill=%d is out of range [0,%d]; resetting the input buffer",
+                 d->in_fill, AAC_DEC_IN_BYTES);
+        d->in_fill = 0;
+    }
 
     /* Top up the compressed-input buffer. Whatever a previous call could not
      * consume (a partial trailing frame) stays at the front, so frames that
@@ -225,6 +248,21 @@ static audio_element_err_t aac_dec_process(audio_element_handle_t self,
         if (raw.consumed == 0) {
             break;  /* no forward progress - avoid spinning */
         }
+        /* raw.len is UNSIGNED (uint32_t, esp_audio_dec_in_raw_t). If the
+         * decoder ever reports consuming more than it was handed - which a
+         * truncated/garbage frame can provoke - the subtraction below wraps
+         * to ~4 billion instead of going negative. That does not just spin:
+         * the loop then walks raw.buffer far past in_buf, and the
+         * `usable - (int)raw.len` below comes out hugely negative, which
+         * sets d->in_fill to a huge value and turns the next call's
+         * memmove() into a multi-kilobyte write past a 2048-byte heap
+         * buffer. That is a heap-corruption bug, not a decode glitch, so
+         * clamp rather than trusting the value. */
+        if (raw.consumed > raw.len) {
+            ESP_LOGE(TAG, "decoder reported consumed=%u of only %u available; clamping",
+                     (unsigned)raw.consumed, (unsigned)raw.len);
+            raw.consumed = raw.len;
+        }
         raw.buffer += raw.consumed;
         raw.len    -= raw.consumed;
     }
@@ -234,6 +272,17 @@ static audio_element_err_t aac_dec_process(audio_element_handle_t self,
      * out of the whole-frame region [0, usable), plus the trailing partial
      * frame [usable, in_fill) that was deliberately withheld above. */
     int consumed = usable - (int)raw.len;
+    /* Belt and braces on top of the clamp above: in_fill indexes a fixed
+     * AAC_DEC_IN_BYTES heap buffer, so every path that assigns it is bounded
+     * here rather than trusting the arithmetic that produced it. A wrong
+     * value costs at most one dropped frame; an unbounded one corrupts the
+     * heap (see the comment in the decode loop). */
+    if (consumed < 0) {
+        consumed = 0;
+    }
+    if (consumed > d->in_fill) {
+        consumed = d->in_fill;
+    }
     int leftover = d->in_fill - consumed;
     if (leftover > 0 && consumed > 0) {
         memmove(d->in_buf, d->in_buf + consumed, leftover);
