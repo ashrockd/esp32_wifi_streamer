@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "app_config.h"
+
 /*
  * The station catalog + persisted/loopable selection.
  *
@@ -17,16 +19,20 @@
  * aac_dec_element -> i2s_stream, see radio_pipeline.c) unchanged - nothing
  * about switching stations changes the element chain.
  *
- * The 5th entry, The Vibe of Vegas (s140762), was added on request and is
- * NOT from that CSV - its stream format has not been verified. This
- * pipeline can only play HLS whose segments are CMAF/fMP4 carrying AAC-LC:
- * tunein_control.c requires an .m3u8 from Tune.ashx, then an EXT-X-MAP init
- * segment to prime fmp4_bridge with. If this station turns out to serve
- * direct MP3, or classic MPEG-TS-segmented HLS, tunein_start_session() will
- * fail cleanly (ESP_ERR_NOT_FOUND) rather than play noise - main.c logs the
- * failure and applies its normal retry backoff, and a next/previous press
- * moves off it - but it will never play. Check the serial log for
- * "Tune.ashx"/"master playlist" errors the first time it is selected.
+ * The 5th entry, The Vibe of Vegas (s140762), is NOT from that CSV and does
+ * NOT go through TuneIn at all any more (2026-09-05) - tunein_control.c
+ * special-cases this station id and hands back a direct, permanent
+ * 181.fm stream URL instead of ever calling TuneIn's profile/Tune.ashx
+ * endpoints for it. See RADIO_VIBE_OF_VEGAS_* in app_config.h for the full
+ * reasoning (quality comparison of 181.fm's available renditions, and why
+ * bypassing TuneIn is safe here) and icy_meta.h for how this station's
+ * title/artist now reaches nowplaying.c (181.fm's stream carries ICY inline
+ * metadata, not the ID3-in-CMAF technique the 4 Apple Music stations use).
+ * This is a plain MP3 stream (esp_decoder auto-detects it), so it takes the
+ * SAME TUNEIN_FORMAT_DIRECT_GENERIC pipeline path
+ * (http_stream -> esp_decoder -> i2s_stream) already used for anything
+ * non-CMAF - nothing about switching stations or the element chain changes
+ * for this entry, only how its session is resolved.
  */
 typedef struct {
     const char *id;    /* TuneIn guideId, e.g. "s345732" */
@@ -41,7 +47,7 @@ static const radio_station_t RADIO_STATIONS[] = {
     { "s345724", "Apple Music Hits" },
     { "s345725", "Apple Music Country" },
     { "s345733", "Apple Music Chill" },
-    { "s140762", "The Vibe of Vegas" }, /* unverified format - see above */
+    { RADIO_VIBE_OF_VEGAS_STATION_ID, "The Vibe of Vegas" }, /* direct 181.fm stream, bypasses TuneIn - see above */
 };
 #define RADIO_STATION_COUNT (sizeof(RADIO_STATIONS) / sizeof(RADIO_STATIONS[0]))
 

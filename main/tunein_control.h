@@ -70,6 +70,17 @@ typedef struct {
      * resolved, so callers can proactively refresh well before any observed
      * expiry rather than relying solely on reacting to HTTP failures. */
     int64_t resolved_at_us;
+
+    /* True only for the direct-stream bypass (currently just The Vibe of
+     * Vegas - see RADIO_VIBE_OF_VEGAS_* in app_config.h and this function's
+     * own top-of-body special case). Tells radio_pipeline_start() to request
+     * ICY inline metadata (Icy-MetaData: 1) on this session's http_stream
+     * connection and install icy_meta.h's stripping tap between http_reader
+     * and the decoder - see icy_meta.h for why this is a separate mechanism
+     * from the ID3-in-CMAF technique the TuneIn/Apple Music stations use.
+     * False (the zero value from tunein_start_session()'s own memset) for
+     * every TuneIn-resolved session. */
+    bool icy_metadata;
 } tunein_session_t;
 
 /*

@@ -7,6 +7,7 @@ idf_component_register(
         "aac_dec_element.c"
         "playlist_prefetch.c"
         "nowplaying.c"
+        "icy_meta.c"
         "station_list.c"
         "avrcp_uart.c"
         "led_viz.c"

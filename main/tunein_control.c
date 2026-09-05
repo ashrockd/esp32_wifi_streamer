@@ -263,6 +263,33 @@ static void make_serial(char *serial, size_t serial_size)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+/*
+ * The Vibe of Vegas bypass - see RADIO_VIBE_OF_VEGAS_* in app_config.h for
+ * the full reasoning (quality comparison, why skipping TuneIn is safe here).
+ * Populates a complete, usable session with ZERO network I/O: no profile
+ * request, no Tune.ashx, no HLS variant/init-segment resolution - just the
+ * fields radio_pipeline.c's TUNEIN_FORMAT_DIRECT_GENERIC path actually reads
+ * (session->format, session->hls_variant_url) plus session->icy_metadata for
+ * icy_meta.h's tap. serial/listen_id are filled in anyway, cheaply, purely
+ * so this session's fields are never garbage if some future caller ever logs
+ * them - nothing downstream currently reads either for this format.
+ */
+static esp_err_t start_direct_stream_session(tunein_session_t *session, const char *station_id)
+{
+    memset(session, 0, sizeof(*session));
+    make_serial(session->serial, sizeof(session->serial));
+    snprintf(session->station_id, sizeof(session->station_id), "%s", station_id);
+    snprintf(session->hls_variant_url, sizeof(session->hls_variant_url), "%s",
+             RADIO_VIBE_OF_VEGAS_DIRECT_URL);
+    session->format = TUNEIN_FORMAT_DIRECT_GENERIC;
+    session->icy_metadata = true;
+    session->resolved_at_us = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "Station %s is the direct-stream bypass - skipping TuneIn entirely", station_id);
+    tunein_log_url("Direct stream URL", session->hls_variant_url, true);
+    return ESP_OK;
+}
+
 void tunein_log_url(const char *label, const char *url, bool include_query)
 {
     if (include_query) {
@@ -641,6 +668,14 @@ esp_err_t tunein_start_session(tunein_session_t *session, const char *station_id
      * station list of its own) working unchanged. */
     if (!station_id) {
         station_id = RADIO_TUNEIN_STATION_ID;
+    }
+
+    /* See start_direct_stream_session()'s own comment: this station never
+     * goes through TuneIn at all, so everything below (profile request,
+     * Tune.ashx, HLS variant/init-segment resolution) is skipped outright
+     * rather than attempted and made to fail. */
+    if (strcmp(station_id, RADIO_VIBE_OF_VEGAS_STATION_ID) == 0) {
+        return start_direct_stream_session(session, station_id);
     }
 
     esp_err_t err = ESP_FAIL;

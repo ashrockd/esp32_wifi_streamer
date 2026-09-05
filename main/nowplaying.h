@@ -139,6 +139,43 @@ void nowplaying_ingest_id3_tag(const uint8_t *data, size_t len);
 void nowplaying_get_current(nowplaying_info_t *out);
 
 /**
+ * The Vibe of Vegas's now-playing source (see icy_meta.h) - a completely
+ * different transport from nowplaying_ingest_id3_tag() above (ICY inline
+ * metadata on a plain MP3 stream, not an ID3v2 tag inside a CMAF 'emsg' box),
+ * but the SAME shared "current track" result: whichever mechanism a given
+ * station actually uses, nowplaying_get_current() below reads one unified
+ * answer without needing to know which.
+ *
+ * `stream_title` is one ICY metadata block's already-extracted StreamTitle
+ * value (icy_meta.c's icy_extract_field(), NOT the raw block text) - e.g.
+ * "Riton x Oliver Heldens - Turn Me On (Radio Edit) ", combined artist+title
+ * in one field per the ICY/Shoutcast convention. Split into
+ * title/subtitle using the same delimiter fallback order 181.fm's own web
+ * player JS uses (site.4.6.15.js's process_song(): " - ", then "-", then
+ * " / "; no delimiter found at all -> the whole string is the title with an
+ * empty artist, same fallback that JS falls back to as well). `art_url` is
+ * an already-extracted StreamArtwork value - pass an empty string (never
+ * NULL) if the station's ICY metadata does not carry one, same as a CMAF tag
+ * with no WXXX frame; there is no separate album field on this path (ICY
+ * carries none), so album is always left empty here.
+ *
+ * A safe no-op if `stream_title` is NULL/empty - most ICY metadata blocks on
+ * a live stream are empty pings between real title changes (icy_meta.c's own
+ * comment), exactly like most CMAF 'emsg' boxes carry no ID3 tag at all - the
+ * previous result is left untouched rather than cleared, same reasoning as
+ * nowplaying_ingest_id3_tag() above.
+ *
+ * ONLY ever called from icy_meta.c's own call chain (http_reader's element
+ * task) - never concurrently with itself, same reasoning as
+ * nowplaying_ingest_id3_tag()'s own threading note, which is why this uses
+ * its own separate scratch rather than sharing nowplaying_ingest_id3_tag()'s
+ * (a CMAF/ID3 station and a direct/ICY station are never both active at
+ * once today, but the two code paths are independent modules that should
+ * not need to coordinate which task owns which scratch buffer).
+ */
+void nowplaying_ingest_icy_title(const char *stream_title, const char *art_url);
+
+/**
  * Clears the cached track back to "nothing known yet" WITHOUT touching
  * anything else. Call this on any genuine station change (see main.c's
  * radio_task) so a track from the PREVIOUS station can never be misread as

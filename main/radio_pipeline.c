@@ -15,6 +15,7 @@
 #include "audio_pipeline.h"
 #include "audio_element.h"
 #include "audio_event_iface.h"
+#include "esp_http_client.h"
 #include "http_stream.h"
 #include "i2s_stream.h"
 #include "ringbuf.h"
@@ -29,6 +30,7 @@
 #include "app_config.h"
 #include "console_cli.h"
 #include "fmp4_bridge.h"
+#include "icy_meta.h"
 #include "led_viz.h"
 #include "playlist_prefetch.h"
 #include "tunein_control.h"
@@ -81,6 +83,15 @@ static int i2s_configured_ch;
  * session->format directly at build time. */
 static tunein_stream_format_t s_active_format = TUNEIN_FORMAT_UNKNOWN;
 
+/* Mirrors session->icy_metadata for the CURRENT session - read by
+ * http_stream_hook() below, which (unlike this function) has no direct
+ * access to `session` (it runs on http_reader's own task, at connect time,
+ * possibly after main.c has already freed the session struct that owned the
+ * original flag - see tunein_control.h's own comment on session lifetime).
+ * Set alongside s_active_format below, cleared alongside it in
+ * radio_pipeline_stop(). */
+static bool s_icy_metadata_active;
+
 /* Heap copy of session->hls_variant_url, kept alive for the life of the
  * pipeline (unlike tunein_session_t itself, which main.c frees right after
  * radio_pipeline_start() returns) - this is the URL playlist prefetching
@@ -107,6 +118,29 @@ static int prefetch_attempts_this_window;
 
 static int http_stream_hook(http_stream_event_msg_t *msg)
 {
+    if (msg->event_id == HTTP_STREAM_PRE_REQUEST) {
+        /* Ask the server for ICY inline metadata (icy_meta.h) - harmless to
+         * request on any connection, but only actually requested for the one
+         * session that wants it, to keep every existing TuneIn/HLS station's
+         * request wire-identical to before.
+         *
+         * icy_meta_reset() is (re)armed HERE rather than once in
+         * radio_pipeline_start(), deliberately: PRE_REQUEST fires before
+         * EVERY esp_http_client_open() on this element, not just the first -
+         * including _http_reconnect()'s close-then-reopen after a transient
+         * read error (http_stream.c's own _http_process()). Each such
+         * reconnect starts an entirely NEW response body, whose own
+         * icy-metaint cycle begins at byte 0 again - resetting only once
+         * up front would leave icy_meta.c's byte-position counters
+         * permanently desynced from the stream after the first reconnect,
+         * silently corrupting audio (metadata bytes misread as MP3 frame
+         * data) rather than just losing the now-playing display. */
+        if (s_icy_metadata_active) {
+            esp_http_client_set_header((esp_http_client_handle_t)msg->http_client, "Icy-MetaData", "1");
+            icy_meta_reset(RADIO_VIBE_OF_VEGAS_ICY_METAINT);
+        }
+        return ESP_OK;
+    }
     if (msg->event_id == HTTP_STREAM_FINISH_PLAYLIST) {
         /* This is a live HLS rendition, not a finite playlist: re-fetch the
          * (still-signed) playlist URL to pick up newly published segments
@@ -201,6 +235,28 @@ static int led_viz_write_cb(audio_element_handle_t self, char *buffer, int len,
         led_viz_feed_pcm(buffer, (size_t)len);
     }
     return rb_write((ringbuf_handle_t)ctx, buffer, len, ticks_to_wait);
+}
+
+/*
+ * ICY inline metadata tap for The Vibe of Vegas - see icy_meta.h. Installed
+ * on http_reader's OUTPUT (one stage earlier than led_viz_write_cb above,
+ * which taps the decoder's), only when session->icy_metadata requested it
+ * (see s_icy_metadata_active's declaration comment and the install site in
+ * radio_pipeline_start() below) - every other station's http_reader keeps
+ * ADF's default direct-to-ringbuffer output, completely untouched.
+ *
+ * Unlike led_viz_write_cb, this one does NOT just observe-then-pass-through:
+ * icy_meta_strip_and_forward() actually removes the interleaved metadata
+ * bytes before they reach `ctx` (http_reader's own output ring buffer, same
+ * as led_viz_write_cb's ctx is the decoder's), which is why it needs the
+ * ring buffer handle itself rather than a fixed-shape rb_write() call here -
+ * all of that lives in icy_meta.c so this stays a one-line wrapper, the same
+ * shape as led_viz_write_cb.
+ */
+static int icy_meta_write_cb(audio_element_handle_t self, char *buffer, int len,
+                             TickType_t ticks_to_wait, void *ctx)
+{
+    return icy_meta_strip_and_forward(buffer, len, (ringbuf_handle_t)ctx, ticks_to_wait);
 }
 
 /*
@@ -442,6 +498,15 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
      * HLS formats keep them on, unchanged. */
     const bool is_hls = (session->format != TUNEIN_FORMAT_DIRECT_GENERIC);
 
+    /* See this flag's own declaration comment: http_stream_hook() reads this
+     * (not session->icy_metadata directly) because it runs later, on
+     * http_reader's own task, possibly after main.c has freed `session`.
+     * Set before http_cfg/http_reader below so the very first connection
+     * already sees the right value - there is no "session in progress
+     * changes its mind" case here, every (re)build of the pipeline goes
+     * through this function from the top. */
+    s_icy_metadata_active = session->icy_metadata;
+
     http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
     http_cfg.type = AUDIO_STREAM_READER;
     http_cfg.enable_playlist_parser = is_hls;
@@ -664,6 +729,28 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
         }
     } else {
         ESP_LOGW(TAG, "Decoder has no output ring buffer; LED visualiser will not react");
+    }
+
+    /* ICY metadata tap - see icy_meta.h. Same "must happen after
+     * audio_pipeline_link()" requirement as the LED tap above (that call is
+     * what creates http_reader's output ring buffer too), just one stage
+     * earlier in the chain: http_reader's own output, not the decoder's.
+     * icy_meta_reset() itself is NOT called here - see http_stream_hook()'s
+     * HTTP_STREAM_PRE_REQUEST handling above for why it has to be armed
+     * there instead, on every (re)connect rather than once here. */
+    if (session->icy_metadata) {
+        ringbuf_handle_t http_out_rb = audio_element_get_output_ringbuf(http_reader);
+        if (http_out_rb) {
+            esp_err_t tap_err = audio_element_set_write_cb(http_reader, icy_meta_write_cb, http_out_rb);
+            if (tap_err != ESP_OK) {
+                ESP_LOGW(TAG, "Could not tap http_reader output for ICY metadata: %s "
+                         "(audio unaffected; now-playing just will not update for this station)",
+                         esp_err_to_name(tap_err));
+            }
+        } else {
+            ESP_LOGW(TAG, "http_reader has no output ring buffer; ICY metadata tap not installed "
+                     "(audio unaffected; now-playing just will not update for this station)");
+        }
     }
 
     /* The resolved media playlist (not the HLS master), or the direct
@@ -1170,6 +1257,7 @@ void radio_pipeline_stop(void)
     /* aac_decoder is NOT reset to NULL - it persists across every session,
      * full rebuild or in-place switch alike. */
     s_active_format = TUNEIN_FORMAT_UNKNOWN;
+    s_icy_metadata_active = false;
 
     ESP_LOGI(TAG, "Pipeline torn down; free heap=%" PRIu32, esp_get_free_heap_size());
 }

@@ -24,6 +24,7 @@
 #include "app_config.h"
 #include "avrcp_uart.h"
 #include "console_cli.h"
+#include "icy_meta.h"
 #include "latency_cal.h"
 #include "led_viz.h"
 #include "nowplaying.h"
@@ -595,6 +596,19 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "nowplaying_init failed: %s; the status log will not show track info",
                  esp_err_to_name(err));
+    }
+
+    /* ICY inline metadata scratch (icy_meta.h) - The Vibe of Vegas's own
+     * now-playing source, a separate mechanism from nowplaying_init() above
+     * (that one is fed from the CMAF stations' ID3-in-emsg tags). Same
+     * "allocate once, up front" reasoning, and equally non-fatal on failure:
+     * radio_pipeline.c's tap still strips the metadata bytes correctly
+     * either way (see icy_meta.c), it just has nowhere to stash the parsed
+     * title/artist. */
+    err = icy_meta_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "icy_meta_init failed: %s; The Vibe of Vegas will still play, "
+                 "just without a title/artist display", esp_err_to_name(err));
     }
 
     /* AVRCP next/previous-station receiver (avrcp_uart.h) - started here,

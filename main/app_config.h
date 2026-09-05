@@ -77,6 +77,65 @@
 #define RADIO_TUNEIN_VERSION        "7.38.0"
 #define RADIO_TUNEIN_FORMATS        "mp3,aac,ogg,flash,html,hls,wma"
 
+/*
+ * The Vibe of Vegas (station_list.h's "s140762") DOES NOT go through TuneIn's
+ * control plane at all any more - tunein_start_session() special-cases this
+ * one station id and skips straight to a direct, permanent stream URL
+ * (tunein_control.c, near the top of tunein_start_session()). Two things
+ * drove that, both verified by hand on 2026-09-05 against 181.fm's own edge
+ * (`curl -I`) and its web player (player.181fm.com, view-source on
+ * js/site.4.6.15.js):
+ *
+ * 1. QUALITY: TuneIn's own resolution for this station was never actually
+ *    verified to work (see station_list.h's old comment) and, separately,
+ *    181.fm serves this exact stream directly at better quality than what
+ *    the station name implies. `listen.181fm.com/181-vibe_64k.aac` (a
+ *    guessable "obvious" URL) is real but is 64kbps HE-AAC/SBR (icy-br: 64,
+ *    Content-Type audio/aacp) - lower quality AND the exact codec shape
+ *    (implicit SBR) this project's AAC decoder has an open, not-yet-
+ *    hardware-confirmed heap-corruption theory about (see
+ *    [[esp32-wifi-streamer-aac-heap-crash]]). site.4.6.15.js's own `streams`
+ *    config reveals 181.fm's OWN player instead loads
+ *    `181-vibe_128k.mp3` - a 128kbps plain MP3 (icy-br: 128, Content-Type
+ *    audio/mpeg) that is both higher quality and sidesteps the AAC/SBR
+ *    decoder question entirely: it takes this project's existing generic
+ *    esp_decoder path (TUNEIN_FORMAT_DIRECT_GENERIC, see tunein_control.h),
+ *    already used for every non-CMAF format, unchanged.
+ *
+ * 2. NO TUNEIN ROUND TRIP: bypassing tunein_start_session()'s profile +
+ *    Tune.ashx HTTP(S) calls entirely for this one station removes two TLS
+ *    handshakes from every (re)connect and one more thing that can fail with
+ *    an opaque TuneIn-side error for a station whose TuneIn resolution was
+ *    never actually confirmed to work.
+ *
+ * Not signed, not time-limited, and not a playlist - a plain, permanent
+ * ICE/Shoutcast-style stream URL - so there is nothing to re-resolve
+ * periodically the way an HLS session's signed URLs need to be; the direct
+ * session tunein_control.c builds for this id just re-populates the same URL
+ * every time (cheap, no network I/O) whenever radio_task loops back around,
+ * whether that is a real station reselect or the proactive RADIO_SESSION_MAX_MS
+ * refresh.
+ *
+ * ICY_METAINT below is this stream's title/artist metadata cadence - see
+ * icy_meta.h. Verified directly (`curl -H "Icy-MetaData: 1" -D -
+ * .../181-vibe_128k.mp3` echoes back `icy-metaint: 16000`) rather than
+ * discovered at connect time: reading the actual response header would need
+ * a local patch to esp-adf's http_stream.c (its own internal
+ * esp_http_client event_handler only forwards Content-Type/-Encoding/-Range
+ * to callers, nothing else - see icy_meta.h's own comment), and 16000 bytes
+ * is exactly one second of audio at 128kbps/8 - a deliberate, conventional
+ * Shoutcast/Triton "DAS" encoder setting for this mountpoint, not something
+ * expected to drift session to session. If 181.fm ever changes it, the
+ * symptom would be nowplaying staying stuck/empty for this station (see
+ * icy_meta.c's parser - a metaint mismatch desyncs the stripper and its
+ * StreamTitle scan stops finding valid text) while audio playback itself
+ * would very likely still glitch or drop out audibly, which is what would
+ * actually surface it.
+ */
+#define RADIO_VIBE_OF_VEGAS_STATION_ID     "s140762"
+#define RADIO_VIBE_OF_VEGAS_DIRECT_URL     "https://listen.181fm.com/181-vibe_128k.mp3"
+#define RADIO_VIBE_OF_VEGAS_ICY_METAINT    16000
+
 /* This chip runs no Bluetooth stack at all - none of Bluedroid's RAM
  * footprint or SBC-encode buffer churn exists here, so these buffers can be
  * meaningfully larger than the single-chip project's without repeating the

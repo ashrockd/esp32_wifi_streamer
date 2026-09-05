@@ -55,6 +55,13 @@ static char *s_scratch_wxxx_desc;
 static char *s_scratch_wxxx_url;
 static nowplaying_info_t *s_ingest_result;
 
+/* ICY path's own result-staging scratch - separate from s_ingest_result
+ * above on purpose, see nowplaying_ingest_icy_title()'s doc comment
+ * (nowplaying.h) for why: different call chain/task than the ID3 path,
+ * mutually exclusive in practice today but kept independent rather than
+ * coupling the two ingest paths to a shared buffer. */
+static nowplaying_info_t *s_icy_result;
+
 #define NOWPLAYING_WXXX_DESC_MAX 32
 
 static void *psram_alloc(size_t size)
@@ -91,9 +98,11 @@ esp_err_t nowplaying_init(void)
     s_scratch_wxxx_desc = psram_alloc(NOWPLAYING_WXXX_DESC_MAX);
     s_scratch_wxxx_url = psram_alloc(NOWPLAYING_ART_URL_MAX);
     s_ingest_result = psram_alloc(sizeof(*s_ingest_result));
+    s_icy_result = psram_alloc(sizeof(*s_icy_result));
 
     if (!s_current || !s_scratch || !s_scratch_artist || !s_scratch_artwork_390 ||
-        !s_scratch_artwork_640 || !s_scratch_wxxx_desc || !s_scratch_wxxx_url || !s_ingest_result) {
+        !s_scratch_artwork_640 || !s_scratch_wxxx_desc || !s_scratch_wxxx_url || !s_ingest_result ||
+        !s_icy_result) {
         ESP_LOGE(TAG, "OOM allocating now-playing buffers - now-playing display will stay empty "
                  "(nothing else is affected)");
         return ESP_ERR_NO_MEM;
@@ -445,6 +454,79 @@ void nowplaying_ingest_id3_tag(const uint8_t *data, size_t len)
     ESP_LOGI(TAG, "Now playing: '%s' - '%s' (album '%s')%s",
              s_ingest_result->title, s_ingest_result->subtitle, s_ingest_result->album,
              s_ingest_result->art_url[0] ? "" : " [no artwork in this tag]");
+}
+
+/* Trims trailing ASCII spaces in place - cosmetic only, for 181.fm titles
+ * observed with a trailing space before the closing quote (e.g.
+ * "Turn Me On (Radio Edit) "). */
+static void rtrim_spaces(char *s)
+{
+    size_t len = strlen(s);
+    while (len > 0 && s[len - 1] == ' ') {
+        s[--len] = '\0';
+    }
+}
+
+void nowplaying_ingest_icy_title(const char *stream_title, const char *art_url)
+{
+    if (!stream_title || stream_title[0] == '\0') {
+        return; /* empty metadata block - a timing ping, not a real update (see this file's header) */
+    }
+    if (!s_icy_result) {
+        return; /* nowplaying_init() never called, or its PSRAM allocation failed */
+    }
+    memset(s_icy_result, 0, sizeof(*s_icy_result));
+
+    /* Same delimiter fallback order as 181.fm's own web player JS
+     * (site.4.6.15.js's process_song()) - see this function's declaration
+     * comment (nowplaying.h) for the full reasoning. */
+    static const char *const delims[] = { " - ", "-", " / " };
+    const char *sep = NULL;
+    size_t delim_len = 0;
+    for (size_t d = 0; d < sizeof(delims) / sizeof(delims[0]); d++) {
+        const char *p = strstr(stream_title, delims[d]);
+        if (p) {
+            sep = p;
+            delim_len = strlen(delims[d]);
+            break;
+        }
+    }
+
+    if (sep) {
+        size_t artist_len = (size_t)(sep - stream_title);
+        size_t n = artist_len < sizeof(s_icy_result->subtitle) - 1 ? artist_len : sizeof(s_icy_result->subtitle) - 1;
+        memcpy(s_icy_result->subtitle, stream_title, n);
+        s_icy_result->subtitle[n] = '\0';
+        strncpy(s_icy_result->title, sep + delim_len, sizeof(s_icy_result->title) - 1);
+        s_icy_result->title[sizeof(s_icy_result->title) - 1] = '\0';
+    } else {
+        /* No recognized delimiter - whole string is the title, empty artist,
+         * same fallback the source JS uses. */
+        strncpy(s_icy_result->title, stream_title, sizeof(s_icy_result->title) - 1);
+        s_icy_result->title[sizeof(s_icy_result->title) - 1] = '\0';
+    }
+    rtrim_spaces(s_icy_result->title);
+    rtrim_spaces(s_icy_result->subtitle);
+
+    if (art_url) {
+        strncpy(s_icy_result->art_url, art_url, sizeof(s_icy_result->art_url) - 1);
+        s_icy_result->art_url[sizeof(s_icy_result->art_url) - 1] = '\0';
+    }
+    /* No separate album field on the ICY path - left empty (already zeroed
+     * by the memset above). */
+    s_icy_result->valid = true;
+
+    if (!s_mutex || !s_current) {
+        return;
+    }
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        *s_current = *s_icy_result;
+        s_updated_tick = xTaskGetTickCount();
+        xSemaphoreGive(s_mutex);
+    }
+    ESP_LOGI(TAG, "Now playing (ICY): '%s' - '%s'%s",
+             s_icy_result->title, s_icy_result->subtitle,
+             s_icy_result->art_url[0] ? "" : " [no artwork in this tag]");
 }
 
 void nowplaying_get_current(nowplaying_info_t *out)
