@@ -73,7 +73,7 @@ esp_err_t album_art_start(void);
  * station change does not proactively clear this the way nowplaying_reset()
  * clears title/artist, but a new station's own first successfully-decoded
  * track naturally replaces it via the normal art_url-changed path above),
- * fills *out_buf/*out_len/*out_version with the current front-buffer
+ * fills *out_buf, *out_len, and *out_version with the current front-buffer
  * snapshot (raw RGB565, exactly RADIO_COMPANION_ART_W * RADIO_COMPANION_ART_H
  * * 2 bytes) and returns true.
  *
