@@ -109,27 +109,60 @@ static esp_err_t download_jpeg(const char *url)
     return err;
 }
 
-/* Nearest-neighbor resize of one RGB565 image into another - see
- * album_art.h's header comment on why this, and not a box filter, for a
- * first cut: simple, correct for both up- and down-scaling (fetch_and_
- * decode() below almost always downscales, but this makes no assumption
- * either way), and entirely adequate for a ~140px on-screen thumbnail. */
-static void resize_nearest_rgb565(const uint16_t *src, int src_w, int src_h,
-                                   uint16_t *dst, int dst_w, int dst_h)
+/* Box-filter resize of one RGB565 image into another: each destination pixel
+ * is the average of every source pixel that maps into it, computed
+ * per-channel (R5/G6/B5) rather than nearest-neighbor's pick-one sampling.
+ * Was nearest-neighbor as a first cut (see the PR that added it, and this
+ * project's TODO item 8) - visibly blocky/aliased on real hardware at the
+ * large downscale ratios here (source art is observed ~390-640px square
+ * against a 240x240 target). This runs once per track change (not
+ * per-frame) on the S3's real CPU/PSRAM headroom, so the extra averaging
+ * work here is negligible; still correct (falls back to a 1x1 box, i.e.
+ * nearest-neighbor) for the rare upscale case fetch_and_decode() doesn't
+ * assume against. */
+static void resize_box_filter_rgb565(const uint16_t *src, int src_w, int src_h,
+                                      uint16_t *dst, int dst_w, int dst_h)
 {
     for (int y = 0; y < dst_h; y++) {
-        int sy = (y * src_h) / dst_h;
-        if (sy >= src_h) {
-            sy = src_h - 1;
+        int sy0 = (y * src_h) / dst_h;
+        int sy1 = ((y + 1) * src_h) / dst_h;
+        if (sy1 <= sy0) {
+            sy1 = sy0 + 1;
         }
-        const uint16_t *src_row = src + (size_t)sy * (size_t)src_w;
+        if (sy1 > src_h) {
+            sy1 = src_h;
+        }
+
         uint16_t *dst_row = dst + (size_t)y * (size_t)dst_w;
         for (int x = 0; x < dst_w; x++) {
-            int sx = (x * src_w) / dst_w;
-            if (sx >= src_w) {
-                sx = src_w - 1;
+            int sx0 = (x * src_w) / dst_w;
+            int sx1 = ((x + 1) * src_w) / dst_w;
+            if (sx1 <= sx0) {
+                sx1 = sx0 + 1;
             }
-            dst_row[x] = src_row[sx];
+            if (sx1 > src_w) {
+                sx1 = src_w;
+            }
+
+            uint32_t r_sum = 0, g_sum = 0, b_sum = 0;
+            int count = 0;
+            for (int sy = sy0; sy < sy1; sy++) {
+                const uint16_t *src_row = src + (size_t)sy * (size_t)src_w;
+                for (int sx = sx0; sx < sx1; sx++) {
+                    uint16_t px = src_row[sx];
+                    r_sum += (px >> 11) & 0x1F;
+                    g_sum += (px >> 5) & 0x3F;
+                    b_sum += px & 0x1F;
+                    count++;
+                }
+            }
+            if (count == 0) {
+                count = 1; /* can't happen (sx1>sx0/sy1>sy0 above), kept as a defensive divide guard */
+            }
+            uint16_t r = (uint16_t)(r_sum / (uint32_t)count);
+            uint16_t g = (uint16_t)(g_sum / (uint32_t)count);
+            uint16_t b = (uint16_t)(b_sum / (uint32_t)count);
+            dst_row[x] = (uint16_t)((r << 11) | (g << 5) | b);
         }
     }
 }
@@ -168,9 +201,9 @@ static esp_err_t fetch_and_decode(const char *url)
     /* Pick the coarsest of esp_jpeg's fixed power-of-two scales that still
      * leaves the decoded image at least as large as the target box in BOTH
      * dimensions - keeps the transient decode buffer/CPU work as small as
-     * possible while still only ever downscaling in resize_nearest_rgb565()
+     * possible while still only ever downscaling in resize_box_filter_rgb565()
      * above (matches the plan's design: real Apple/TuneIn art is observed
-     * ~390-640px square against a 140x140 target, so this almost always
+     * ~390-640px square against a 240x240 target, so this almost always
      * lands on 1/2 or 1/4, never upscaling). Falls back to no scale at all
      * if the source is already smaller than the target box in either
      * dimension. */
@@ -218,8 +251,8 @@ static esp_err_t fetch_and_decode(const char *url)
         return ESP_FAIL;
     }
 
-    resize_nearest_rgb565((const uint16_t *)dec_buf, dec_out.width, dec_out.height,
-                           (uint16_t *)s_back, RADIO_COMPANION_ART_W, RADIO_COMPANION_ART_H);
+    resize_box_filter_rgb565((const uint16_t *)dec_buf, dec_out.width, dec_out.height,
+                              (uint16_t *)s_back, RADIO_COMPANION_ART_W, RADIO_COMPANION_ART_H);
     heap_caps_free(dec_buf);
 
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {

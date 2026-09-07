@@ -35,7 +35,7 @@
  *        change already calls nowplaying_reset()) rather than adding any
  *        new event plumbing:
  *          {"valid":true,"tuning":false,"title":"...","subtitle":"...",
- *           "album":"...","art_version":4,"art_w":140,"art_h":140,
+ *           "album":"...","art_version":4,"art_w":240,"art_h":240,
  *           "station_index":1,"station_name":"...","age_ms":1234}
  *   GET  /stations - the station catalog, JSON:
  *          {"count":5,"current_index":1,

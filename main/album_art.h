@@ -20,16 +20,17 @@
  *
  * Decoder: espressif/esp_jpeg (managed component, added via
  * main/idf_component.yml - this S3 has no hardware JPEG block, only the P4
- * does, so this is a plain software decode). Resize: nearest-neighbor, done
- * by hand below - esp_jpeg_decode() itself only offers coarse power-of-two
- * scale factors (0, 1/2, 1/4, 1/8), not an arbitrary target size, so
- * fetch_and_decode() below picks whichever of those scales keeps the
- * decoded image at least as large as the target box in both dimensions
- * (falling back to no scale if the source is already smaller), then resizes
- * that down to the exact RADIO_COMPANION_ART_W x RADIO_COMPANION_ART_H box
- * itself. Good enough for a small on-screen thumbnail; not attempting a
- * higher-quality box filter for a first cut (see this file's own comment
- * above resize_nearest_rgb565()).
+ * does, so this is a plain software decode). Resize: a box filter, done by
+ * hand below (resize_box_filter_rgb565() - averages every source pixel that
+ * maps into each destination pixel, rather than nearest-neighbor's pick-one
+ * sampling; was nearest-neighbor as a first cut, replaced once real hardware
+ * testing showed it visibly blocky/aliased) - esp_jpeg_decode() itself only
+ * offers coarse power-of-two scale factors (0, 1/2, 1/4, 1/8), not an
+ * arbitrary target size, so fetch_and_decode() below picks whichever of
+ * those scales keeps the decoded image at least as large as the target box
+ * in both dimensions (falling back to no scale if the source is already
+ * smaller), then box-filters that down to the exact RADIO_COMPANION_ART_W x
+ * RADIO_COMPANION_ART_H box itself.
  *
  * Own dedicated task (album_art_task, RADIO_COMPANION_ART_TASK_STACK/
  * _PRIORITY in app_config.h - deliberately BELOW radio_task's own priority
