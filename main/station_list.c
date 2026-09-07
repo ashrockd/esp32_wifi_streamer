@@ -97,6 +97,18 @@ uint8_t station_list_prev(uint8_t current)
     return save_index(idx);
 }
 
+uint8_t station_list_select(uint8_t idx)
+{
+    if (idx >= RADIO_STATION_COUNT) {
+        ESP_LOGE(TAG, "station_list_select(%u) out of range (have %u stations); clamping to 0 - "
+                 "this should have been rejected by the caller before reaching here",
+                 (unsigned)idx, (unsigned)RADIO_STATION_COUNT);
+        idx = 0;
+    }
+    ESP_LOGI(TAG, "Station -> select: %s (%s)", RADIO_STATIONS[idx].name, RADIO_STATIONS[idx].id);
+    return save_index(idx);
+}
+
 /* See station_list.h's doc comment - a live status mirror, not the
  * persisted selection. */
 static volatile uint8_t s_now_playing_idx;
