@@ -13,6 +13,8 @@ idf_component_register(
         "led_viz.c"
         "console_cli.c"
         "latency_cal.c"
+        "companion_server.c"
+        "album_art.c"
     INCLUDE_DIRS "."
     REQUIRES
         app_update
@@ -22,12 +24,15 @@ idf_component_register(
         driver
         esp_event
         esp_http_client
+        esp_http_server
         esp_netif
         esp_driver_rmt
         esp_partition
         esp_wifi
         json
         mbedtls
+        mdns
+        esp_jpeg
         nvs_flash
         spi_flash
 )

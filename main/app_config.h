@@ -402,3 +402,45 @@
 #define RADIO_I2S_WS_GPIO           5
 #define RADIO_I2S_DATA_GPIO         6
 #define RADIO_I2S_SAMPLE_RATE       44100
+
+/*
+ * DP666 companion display (companion_server.h/.c, album_art.h/.c) - a third,
+ * independent WiFi/HTTP/mDNS link, unrelated to the two existing I2S/UART
+ * links to esp32_bt_speaker above. A TEF6686-based FM/DAB tuner board
+ * (esp32_dp666_companion, a separate PlatformIO/Arduino repo) polls this
+ * chip's small HTTP+JSON server for now-playing metadata/station list/album
+ * art and can request a station change - this chip never has to know the
+ * DP666's address (see the plan's "poll model" decision). See
+ * companion_server.h for the routes and avrcp_uart.h's AVRCP_CMD_SELECT for
+ * how a `/tune` request reaches radio_task the same way an AVRCP/console
+ * next/prev already does.
+ */
+/* Plain HTTP (not HTTPS) - this is a LAN-only peer link to a device with no
+ * TLS budget to spare (esp32_dp666_companion has no PSRAM), same reasoning
+ * as that repo's own plain WiFiClient choice. */
+#define RADIO_COMPANION_HTTP_PORT            80
+/* -> esp32radio.local, resolved by the DP666 via ESPmDNS.h. */
+#define RADIO_COMPANION_MDNS_HOSTNAME         "esp32radio"
+/* Album art box size - a MUST-MATCH pair with the DP666's own compiled-in
+ * expectation (it sanity-checks the /art response's X-Art-W/X-Art-H headers
+ * against this and skips the blit, rather than crashing, on a mismatch).
+ * Chosen against that board's actual 320x240 ILI9341 landscape layout, not
+ * arbitrary - see the plan's C2 section for the on-screen layout this size
+ * was picked against. */
+#define RADIO_COMPANION_ART_W                 140
+#define RADIO_COMPANION_ART_H                 140
+/* Bounds the PSRAM scratch buffer album_art.c downloads one JPEG into before
+ * decoding - Apple/TuneIn art is observed ~390-640px square, comfortably
+ * under this even at high JPEG quality. Generous because it's PSRAM (see
+ * nowplaying.c's psram_alloc() pattern, reused here), not a tight budget. */
+#define RADIO_COMPANION_ART_MAX_JPEG_BYTES    (400 * 1024)
+/* How often album_art_task re-checks nowplaying_get_current() for a changed
+ * art_url. Not tied to the DP666's own poll cadence - this chip decodes art
+ * independently of whether anything is currently polling /art at all. */
+#define RADIO_COMPANION_ART_POLL_INTERVAL_MS  2000
+#define RADIO_COMPANION_HTTPD_STACK           6144
+#define RADIO_COMPANION_HTTPD_PRIORITY        5
+/* Below radio_task's priority (5) - decoding/resizing album art must never
+ * preempt audio playback. */
+#define RADIO_COMPANION_ART_TASK_STACK        8192
+#define RADIO_COMPANION_ART_TASK_PRIORITY     3

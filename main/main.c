@@ -23,6 +23,7 @@
 
 #include "app_config.h"
 #include "avrcp_uart.h"
+#include "companion_server.h"
 #include "console_cli.h"
 #include "icy_meta.h"
 #include "latency_cal.h"
@@ -414,17 +415,19 @@ static void radio_task(void *pvParameters)
 
         avrcp_cmd_t station_cmd = AVRCP_CMD_NONE;
         bool calibrate_requested = false;
+        uint8_t select_idx = 0;
         if (err == ESP_OK) {
             /* audio_pipeline_run() is non-blocking - it only launches the
              * element tasks - so block here for as long as playback is
              * actually healthy, and only fall through when the pipeline
              * reports an error (e.g. the signed HLS URL expired), the
-             * defensive max session duration elapses, an AVRCP/console next/
-             * previous command arrives (avrcp_uart.h, console_cli.h), or a
+             * defensive max session duration elapses, an AVRCP/console/
+             * companion-display next/previous/select command arrives
+             * (avrcp_uart.h, console_cli.h, companion_server.h), or a
              * console `cal` command requests latency calibration
              * (latency_cal.h). */
-            ESP_LOGI(TAG, "Playback running; watching for pipeline errors, session expiry, next/previous, or calibration");
-            err = radio_pipeline_wait(pdMS_TO_TICKS(RADIO_SESSION_MAX_MS), &station_cmd, &calibrate_requested);
+            ESP_LOGI(TAG, "Playback running; watching for pipeline errors, session expiry, next/previous/select, or calibration");
+            err = radio_pipeline_wait(pdMS_TO_TICKS(RADIO_SESSION_MAX_MS), &station_cmd, &calibrate_requested, &select_idx);
         }
 
         /* 2026-09-04: NOT called unconditionally here any more. It used to
@@ -479,6 +482,21 @@ static void radio_task(void *pvParameters)
         }
         if (station_cmd == AVRCP_CMD_PREV) {
             current_station_idx = station_list_prev(current_station_idx);
+            consecutive_failures = 0;
+            continue;
+        }
+        if (station_cmd == AVRCP_CMD_SELECT) {
+            /* DP666 companion display's POST /tune - a direct jump rather
+             * than a next/prev hop (companion_server.h). Reuses the exact
+             * same "deliberate, healthy end to the session" handling as
+             * NEXT/PREV above: clears the failure counter and loops back
+             * around, where the top-of-loop current_station_idx !=
+             * previous_station_idx check (this file, above) fires
+             * nowplaying_reset() and station_list_set_now_playing() exactly
+             * as it would for any other genuine station change - this is
+             * what makes GET /nowplaying's "tuning" field go true the
+             * instant this fires, with no separate signal needed. */
+            current_station_idx = station_list_select(select_idx);
             consecutive_failures = 0;
             continue;
         }
@@ -557,6 +575,7 @@ void app_main(void)
     esp_log_level_set("CONSOLE", ESP_LOG_DEBUG);
     esp_log_level_set("LATENCY_CAL", ESP_LOG_DEBUG);
     esp_log_level_set("NOWPLAYING", ESP_LOG_DEBUG);
+    esp_log_level_set("COMPANION", ESP_LOG_DEBUG);
 
     ESP_LOGI(TAG, "ESP32 Wi-Fi/streamer chip booting (I2S -> esp32_bt_speaker)");
     ESP_LOGI(TAG, "Compiled-in default station=%s (%u stations available; the one actually started is "
@@ -635,6 +654,23 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start serial console: %s (console control will not work; "
                  "AVRCP next/previous and the LED default threshold are unaffected)",
+                 esp_err_to_name(err));
+    }
+
+    /* DP666 companion display HTTP+JSON server (companion_server.h) - a
+     * third, independent way to drive station selection (POST /tune),
+     * alongside the AVRCP UART link and the serial console above, plus
+     * now-playing/station-list/album-art endpoints for that display to poll.
+     * Started here for consistency with every other optional subsystem in
+     * this function, though unlike them it cannot actually finish its own
+     * setup (mDNS + the HTTP server itself) until this chip has an IP
+     * address - see companion_server_start()'s own doc comment for exactly
+     * why and how it defers that. Not fatal on failure: the radio still
+     * plays, it just cannot be seen/driven from the DP666. */
+    err = companion_server_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start companion display server: %s (DP666 companion display will not work; "
+                 "AVRCP next/previous and the console are unaffected)",
                  esp_err_to_name(err));
     }
 

@@ -28,6 +28,7 @@
 #include "board_pins_config.h"
 
 #include "app_config.h"
+#include "companion_server.h"
 #include "console_cli.h"
 #include "fmp4_bridge.h"
 #include "icy_meta.h"
@@ -819,6 +820,20 @@ esp_err_t radio_pipeline_start(tunein_session_t *session)
         }
     }
 
+    /* Third, independent command source - the DP666 companion display's
+     * `POST /tune` (companion_server.h). Same pattern, same ordering
+     * requirement. */
+    audio_event_iface_handle_t companion_evt = companion_server_get_event_iface();
+    if (companion_evt) {
+        esp_err_t listen_err = audio_event_iface_set_listener(companion_evt, event_iface);
+        if (listen_err != ESP_OK) {
+            ESP_LOGW(TAG, "Could not add the companion-display doorbell to the pipeline event set: %s "
+                     "(a /tune request still works - taken from the command queue on the next "
+                     "event or prefetch tick - but is no longer instant)",
+                     esp_err_to_name(listen_err));
+        }
+    }
+
     esp_err_t err = audio_pipeline_run(pipeline);
     ESP_LOGI(TAG, "audio_pipeline_run returned: %s (playback continues in the background; "
              "call radio_pipeline_wait() to block until it needs replacing)", esp_err_to_name(err));
@@ -911,7 +926,8 @@ static void service_playlist_prefetch(void)
     }
 }
 
-esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd, bool *out_calibrate)
+esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_station_cmd, bool *out_calibrate,
+                               uint8_t *out_select_index)
 {
     if (!event_iface) {
         return ESP_ERR_INVALID_STATE;
@@ -987,6 +1003,22 @@ esp_err_t radio_pipeline_wait(TickType_t max_session_ticks, avrcp_cmd_t *out_sta
             ESP_LOGI(TAG, "Console station-change command received; ending this session for a station switch");
             if (out_station_cmd) {
                 *out_station_cmd = mapped;
+            }
+            return ESP_OK;   /* healthy session, deliberately ended - no error backoff */
+        }
+
+        /* Third, independent source of a station-change request: the DP666
+         * companion display's `POST /tune {"index":N}` (companion_server.h).
+         * Unlike NEXT/PREV above, this one carries a specific target index
+         * rather than a direction, hence the separate out_select_index
+         * out-param - see this function's declaration comment. */
+        if (companion_server_take_command(0) == AVRCP_CMD_SELECT) {
+            ESP_LOGI(TAG, "Companion-display station-select command received; ending this session for a station switch");
+            if (out_station_cmd) {
+                *out_station_cmd = AVRCP_CMD_SELECT;
+            }
+            if (out_select_index) {
+                *out_select_index = companion_server_take_pending_station_index();
             }
             return ESP_OK;   /* healthy session, deliberately ended - no error backoff */
         }
@@ -1222,6 +1254,10 @@ void radio_pipeline_stop(void)
         audio_event_iface_handle_t console_evt = console_cli_get_event_iface();
         if (console_evt) {
             audio_event_iface_remove_listener(event_iface, console_evt);
+        }
+        audio_event_iface_handle_t companion_evt = companion_server_get_event_iface();
+        if (companion_evt) {
+            audio_event_iface_remove_listener(event_iface, companion_evt);
         }
         audio_pipeline_remove_listener(pipeline);
         audio_event_iface_destroy(event_iface);

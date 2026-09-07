@@ -56,6 +56,17 @@ typedef enum {
     AVRCP_CMD_NONE = 0,
     AVRCP_CMD_NEXT,
     AVRCP_CMD_PREV,
+    /* NOT produced by this file's own UART parser - this chip has no
+     * Bluetooth stack, so nothing on THIS link ever sends a "select station
+     * N" command. Added here anyway because this is the canonical command
+     * type radio_pipeline_wait() already returns to its caller: the DP666
+     * companion display's `POST /tune {"index":N}` (companion_server.h) is a
+     * THIRD, independent command source alongside this UART link and
+     * console_cli.h, and reuses this same enum/plumbing rather than growing
+     * its own parallel one. See radio_pipeline.h's out_select_index
+     * out-param and main.c's radio_task() for how the index actually
+     * travels alongside this command. */
+    AVRCP_CMD_SELECT,
 } avrcp_cmd_t;
 
 /* Installs the UART driver, creates the command queue and the doorbell

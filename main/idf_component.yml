@@ -1,0 +1,22 @@
+# Managed (Component Registry) dependencies for main/ - this project's first
+# use of the component manager at all (confirmed: no idf_component.yml
+# existed anywhere in this project before the DP666 companion-display
+# feature). Both are needed for companion_server.c/album_art.c
+# (esp32-wifi-streamer side of the DP666 companion display - see the plan's
+# B1/B2 sections) and are NOT built-in IDF v5.x components - they were split
+# out to the Component Registry:
+#   - espressif/mdns:    advertises RADIO_COMPANION_MDNS_HOSTNAME
+#                        (app_config.h) so the DP666 can find this chip
+#                        without needing to know its IP.
+#   - espressif/esp_jpeg: software JPEG decode for album_art.c - this S3 has
+#                        no hardware JPEG block (only the P4 does).
+# Verified directly against both components' actual source (github.com/
+# espressif/esp-protocols for mdns, github.com/espressif/idf-extra-components
+# for esp_jpeg) during implementation, not guessed - see the CMakeLists.txt
+# REQUIRES entries ("mdns", "esp_jpeg") which match each component's own
+# un-overridden idf_component_register() call (directory name == component
+# name in both cases).
+dependencies:
+  idf: ">=5.5"
+  espressif/mdns: "^1.3"
+  espressif/esp_jpeg: "^1.2"

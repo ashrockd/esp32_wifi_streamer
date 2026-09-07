@@ -68,6 +68,20 @@ uint8_t station_list_next(uint8_t current);
 uint8_t station_list_prev(uint8_t current);
 
 /*
+ * Jumps directly to station `idx` (the DP666 companion display's
+ * `POST /tune` - see companion_server.h - is the only caller today; next/
+ * prev above cover the AVRCP/console case), persists it to NVS, and returns
+ * it - same persistence behavior as station_list_next/prev, reusing the
+ * same save_index() helper. `idx` must already be < RADIO_STATION_COUNT;
+ * out-of-range values are clamped to 0 and logged as an error rather than
+ * indexing RADIO_STATIONS out of bounds - callers (companion_server.c's
+ * `/tune` handler) are expected to validate range themselves and return an
+ * HTTP 400 instead of ever reaching this fallback, but it exists so a bug in
+ * that validation degrades safely instead of corrupting memory.
+ */
+uint8_t station_list_select(uint8_t idx);
+
+/*
  * Live "what's currently selected" mirror - NOT the persisted NVS value
  * (station_list_load_index() above already covers reading that back on
  * boot). main.c's radio_task calls the setter on every station (re)
