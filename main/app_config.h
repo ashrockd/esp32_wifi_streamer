@@ -424,11 +424,15 @@
 /* Album art box size - a MUST-MATCH pair with the DP666's own compiled-in
  * expectation (it sanity-checks the /art response's X-Art-W/X-Art-H headers
  * against this and skips the blit, rather than crashing, on a mismatch).
- * Chosen against that board's actual 320x240 ILI9341 landscape layout, not
- * arbitrary - see the plan's C2 section for the on-screen layout this size
- * was picked against. */
-#define RADIO_COMPANION_ART_W                 140
-#define RADIO_COMPANION_ART_H                 140
+ * Chosen against that board's on-screen layout - companion mode there runs
+ * its own 240x320 PORTRAIT rotation (independent of Normal Radio mode's
+ * landscape one), with this box spanning the full 240px width at the top of
+ * the screen; see esp32_dp666_companion/CLAUDE.md's "Companion mode
+ * architecture" section and that repo's src/companion.cpp for the layout
+ * this size was picked against. Was 140x140 (a smaller landscape-corner box)
+ * before that board's portrait-layout follow-up work. */
+#define RADIO_COMPANION_ART_W                 240
+#define RADIO_COMPANION_ART_H                 240
 /* Bounds the PSRAM scratch buffer album_art.c downloads one JPEG into before
  * decoding - Apple/TuneIn art is observed ~390-640px square, comfortably
  * under this even at high JPEG quality. Generous because it's PSRAM (see
