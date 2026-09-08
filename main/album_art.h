@@ -39,6 +39,19 @@
  * only doing any network/decode work at all when the art_url has actually
  * changed since the last attempt - most polls are a no-op string compare.
  *
+ * 2026-09-09: when nowplaying_info_t.art_url is EMPTY (a station that
+ * doesn't embed its own artwork at all, e.g. "Vibes of Vegas" over plain
+ * ICY metadata - see art_fallback.h), album_art_task instead tries a
+ * lookup-by-title/artist fallback (art_fallback_resolve(), deduped by
+ * (title, subtitle) rather than by URL) and, on a hit, feeds the resolved
+ * URL into this exact same fetch_and_decode() pipeline - fetch_and_decode()
+ * itself has no idea a URL came from a fallback lookup rather than the
+ * stream's own metadata. That fallback's primary tier (iTunes) explicitly
+ * requests artwork at exactly RADIO_COMPANION_ART_W x _H, which is also why
+ * fetch_and_decode() below has a fast path that skips
+ * resize_box_filter_rgb565() entirely when the downloaded JPEG is already
+ * that exact size, rather than resizing (see that function's own comment).
+ *
  * Buffers: everything here is PSRAM-backed (the psram_alloc() pattern this
  * file copies from nowplaying.c/icy_meta.c - see those files' own comments
  * for why each module keeps its own local copy rather than sharing one) -

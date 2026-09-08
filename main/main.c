@@ -576,6 +576,7 @@ void app_main(void)
     esp_log_level_set("LATENCY_CAL", ESP_LOG_DEBUG);
     esp_log_level_set("NOWPLAYING", ESP_LOG_DEBUG);
     esp_log_level_set("COMPANION", ESP_LOG_DEBUG);
+    esp_log_level_set("ART_FALLBACK", ESP_LOG_DEBUG);
 
     ESP_LOGI(TAG, "ESP32 Wi-Fi/streamer chip booting (I2S -> esp32_bt_speaker)");
     ESP_LOGI(TAG, "Compiled-in default station=%s (%u stations available; the one actually started is "
