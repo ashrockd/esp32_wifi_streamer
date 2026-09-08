@@ -14,6 +14,7 @@
 #include "jpeg_decoder.h"
 
 #include "app_config.h"
+#include "art_fallback.h"
 #include "nowplaying.h"
 
 static const char *TAG = "COMPANION";
@@ -40,6 +41,15 @@ static size_t s_jpeg_len;
  * is what gates a retry, to avoid hammering a permanently-broken URL every
  * RADIO_COMPANION_ART_POLL_INTERVAL_MS. */
 static char s_last_url[NOWPLAYING_ART_URL_MAX];
+
+/* Dedupe for the fallback-lookup path below (art_fallback.h) - separate from
+ * s_last_url above because there IS no URL yet to dedupe by until AFTER a
+ * lookup succeeds; keyed on (title, subtitle) instead, same "attempted
+ * before the fetch, regardless of outcome" reasoning as s_last_url, so a
+ * track this fallback can't resolve is not retried every
+ * RADIO_COMPANION_ART_POLL_INTERVAL_MS for as long as it keeps playing. */
+static char s_last_fallback_title[NOWPLAYING_TITLE_MAX];
+static char s_last_fallback_subtitle[NOWPLAYING_SUBTITLE_MAX];
 
 static bool s_started;
 
@@ -198,6 +208,46 @@ static esp_err_t fetch_and_decode(const char *url)
         return ESP_FAIL;
     }
 
+    /* Source is EXACTLY the target box already - decode straight into
+     * s_back at full resolution/no scale and skip resize_box_filter_rgb565()
+     * (and the transient dec_buf allocation) entirely: box-filtering a
+     * same-size image would only average each destination pixel over
+     * exactly one source pixel - an identity transform done the expensive
+     * way, not a real resize. Only ever true for a fallback-resolved iTunes
+     * URL today (art_fallback.c's itunes_lookup() explicitly requests
+     * RADIO_COMPANION_ART_W x _H) - real embedded Apple/TuneIn art is
+     * observed ~390-640px square, so this is a genuinely new path, not a
+     * silent behavior change to the existing one. */
+    if (info_out.width == RADIO_COMPANION_ART_W && info_out.height == RADIO_COMPANION_ART_H) {
+        esp_jpeg_image_cfg_t direct_cfg = {
+            .indata = s_jpeg_buf,
+            .indata_size = (uint32_t)s_jpeg_len,
+            .outbuf = s_back,
+            .outbuf_size = (uint32_t)ALBUM_ART_BUF_BYTES,
+            .out_format = JPEG_IMAGE_FORMAT_RGB565,
+            .out_scale = JPEG_IMAGE_SCALE_0,
+        };
+        esp_jpeg_image_output_t direct_out = {0};
+        err = esp_jpeg_decode(&direct_cfg, &direct_out);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_jpeg_decode (exact-size fast path) failed for %s: %s",
+                     url, esp_err_to_name(err));
+            return ESP_FAIL;
+        }
+
+        if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            uint8_t *tmp = s_front;
+            s_front = s_back;
+            s_back = tmp;
+            s_version++;
+            xSemaphoreGive(s_mutex);
+        }
+        ESP_LOGI(TAG, "Album art decoded (%ux%u source, exact match - no resize/postprocessing) "
+                 "and published (version %" PRIu32 ")",
+                 (unsigned)info_out.width, (unsigned)info_out.height, s_version);
+        return ESP_OK;
+    }
+
     /* Pick the coarsest of esp_jpeg's fixed power-of-two scales that still
      * leaves the decoded image at least as large as the target box in BOTH
      * dimensions - keeps the transient decode buffer/CPU work as small as
@@ -277,21 +327,58 @@ static void album_art_task(void *arg)
 
         nowplaying_info_t info;
         nowplaying_get_current(&info);
-        if (!info.valid || info.art_url[0] == '\0') {
+        if (!info.valid) {
             continue;
         }
-        if (strcmp(info.art_url, s_last_url) == 0) {
-            continue; /* already attempted this exact URL - nothing new to do */
-        }
-        /* Marked as attempted BEFORE the fetch, regardless of outcome - a
-         * failure (dead link, transient network blip) is retried only when
-         * the track/art_url itself changes again, not every poll interval,
-         * so a permanently-broken URL cannot turn into a tight retry loop
-         * hammering the CDN every RADIO_COMPANION_ART_POLL_INTERVAL_MS. */
-        strncpy(s_last_url, info.art_url, sizeof(s_last_url) - 1);
-        s_last_url[sizeof(s_last_url) - 1] = '\0';
 
-        fetch_and_decode(info.art_url);
+        if (info.art_url[0] != '\0') {
+            /* Station embeds its own artwork (e.g. Apple Music-curated, via
+             * HLS ID3) - existing path, unchanged. */
+            if (strcmp(info.art_url, s_last_url) == 0) {
+                continue; /* already attempted this exact URL - nothing new to do */
+            }
+            /* Marked as attempted BEFORE the fetch, regardless of outcome -
+             * a failure (dead link, transient network blip) is retried only
+             * when the track/art_url itself changes again, not every poll
+             * interval, so a permanently-broken URL cannot turn into a
+             * tight retry loop hammering the CDN every
+             * RADIO_COMPANION_ART_POLL_INTERVAL_MS. */
+            strncpy(s_last_url, info.art_url, sizeof(s_last_url) - 1);
+            s_last_url[sizeof(s_last_url) - 1] = '\0';
+            fetch_and_decode(info.art_url);
+            continue;
+        }
+
+        /* No embedded artwork for this track (e.g. ICY-only stations like
+         * "Vibes of Vegas" - see nowplaying.h) - try a lookup-by-title/
+         * artist fallback (art_fallback.h) instead, deduped by (title,
+         * subtitle) rather than by URL since there is no URL yet to dedupe
+         * by - same "attempted before the fetch, regardless of outcome"
+         * reasoning as the embedded path above. */
+        if (info.title[0] == '\0') {
+            continue;
+        }
+        if (strcmp(info.title, s_last_fallback_title) == 0 &&
+            strcmp(info.subtitle, s_last_fallback_subtitle) == 0) {
+            continue;
+        }
+        strncpy(s_last_fallback_title, info.title, sizeof(s_last_fallback_title) - 1);
+        s_last_fallback_title[sizeof(s_last_fallback_title) - 1] = '\0';
+        strncpy(s_last_fallback_subtitle, info.subtitle, sizeof(s_last_fallback_subtitle) - 1);
+        s_last_fallback_subtitle[sizeof(s_last_fallback_subtitle) - 1] = '\0';
+
+        char resolved_url[ART_FALLBACK_URL_MAX];
+        if (art_fallback_resolve(info.title, info.subtitle, resolved_url, sizeof(resolved_url))) {
+            /* Feed the resolved URL into the exact same pipeline an
+             * embedded art_url would use - fetch_and_decode() neither knows
+             * nor cares where a URL came from, so this is the whole
+             * integration: nothing below this line is fallback-specific.
+             * Also recorded into s_last_url so a later track that happens
+             * to embed this SAME url directly does not re-fetch it. */
+            strncpy(s_last_url, resolved_url, sizeof(s_last_url) - 1);
+            s_last_url[sizeof(s_last_url) - 1] = '\0';
+            fetch_and_decode(resolved_url);
+        }
     }
 }
 
@@ -314,6 +401,18 @@ esp_err_t album_art_start(void)
         ESP_LOGE(TAG, "OOM allocating album-art buffers - /art will stay empty (204); "
                  "nothing else is affected");
         return ESP_ERR_NO_MEM;
+    }
+
+    /* Lookup-by-title/artist fallback (art_fallback.h) for stations that
+     * don't embed their own artwork - not fatal on failure, same as every
+     * other allocation above: album_art_task simply skips straight past the
+     * fallback attempt (art_fallback_resolve() degrades to always returning
+     * false) and behaves exactly as it did before this feature existed. */
+    esp_err_t fallback_err = art_fallback_init();
+    if (fallback_err != ESP_OK) {
+        ESP_LOGW(TAG, "art_fallback_init failed: %s; stations with no embedded artwork "
+                 "will show none on the DP666 (embedded artwork is unaffected)",
+                 esp_err_to_name(fallback_err));
     }
 
     BaseType_t ok = xTaskCreate(album_art_task, "album_art", RADIO_COMPANION_ART_TASK_STACK,

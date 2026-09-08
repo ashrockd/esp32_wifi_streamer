@@ -445,6 +445,18 @@
 #define RADIO_COMPANION_HTTPD_STACK           6144
 #define RADIO_COMPANION_HTTPD_PRIORITY        5
 /* Below radio_task's priority (5) - decoding/resizing album art must never
- * preempt audio playback. */
-#define RADIO_COMPANION_ART_TASK_STACK        8192
+ * preempt audio playback.
+ *
+ * 2026-09-09: raised 8192 -> 12288 alongside art_fallback.h/.c (lookup-by-
+ * title/artist artwork for stations with no embedded art) - this task can
+ * now run up to three sequential blocking HTTPS round trips (iTunes,
+ * MusicBrainz+CoverArtArchive, Deezer) plus cJSON parsing of up to a
+ * 64KB MusicBrainz response (ART_FALLBACK_JSON_BUF_BYTES) per poll, each
+ * with its own few-hundred-byte local URL/query buffers, on top of the
+ * original JPEG-decode work this stack was sized for alone. Not measured
+ * against real hardware yet - a generous increase to stay well clear of a
+ * stack-overflow crash (this project's most common real hardware failure
+ * mode, per this file's own RADIO_HTTP_BUFFER_BYTES/RADIO_DMA_FREE_
+ * CRITICAL_BYTES history) rather than a tight one. */
+#define RADIO_COMPANION_ART_TASK_STACK        12288
 #define RADIO_COMPANION_ART_TASK_PRIORITY     3

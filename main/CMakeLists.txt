@@ -15,6 +15,7 @@ idf_component_register(
         "latency_cal.c"
         "companion_server.c"
         "album_art.c"
+        "art_fallback.c"
     INCLUDE_DIRS "."
     REQUIRES
         app_update
