@@ -20,8 +20,18 @@ name: Build firmware (esp32s3)
 on:
   push:
     branches: [main]
+    # Skip the ~4 minute Docker/ESP-IDF build for changes that can't affect
+    # it - a docs-only push (e.g. TODO.md) has no reason to rebuild firmware.
+    # paths-ignore only skips the run when EVERY changed file matches one of
+    # these, so a PR touching both a .md and real source still builds.
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
   workflow_dispatch: {}
 
 jobs:
